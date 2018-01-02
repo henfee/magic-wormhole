@@ -92,6 +92,8 @@ class _DelegatedWormhole(object):
         self._key = key # for derive_key()
     def got_verifier(self, verifier):
         self._delegate.wormhole_got_verifier(verifier)
+    def got_wormhole_versions(self, our_side, their_side, wormhole_versions):
+        pass # internal, not delegated
     def got_versions(self, versions):
         self._delegate.wormhole_got_versions(versions)
     def received(self, plaintext):
@@ -107,6 +109,7 @@ class _DeferredWormhole(object):
         self._key = None
         self._key_observer = OneShotObserver(eq)
         self._verifier_observer = OneShotObserver(eq)
+        self._wormhole_versions_and_sides_observer = OneShotObserver(eq)
         self._version_observer = OneShotObserver(eq)
         self._received_observer = SequenceObserver(eq)
         self._closed = False
@@ -136,6 +139,9 @@ class _DeferredWormhole(object):
     def get_versions(self):
         return self._version_observer.when_fired()
 
+    def _get_wormhole_versions(self): # internal
+        return self._wormhole_versions_and_sides_observer.when_fired()
+
     def get_message(self):
         return self._received_observer.when_next_event()
 
@@ -162,6 +168,12 @@ class _DeferredWormhole(object):
         if not self._key: raise NoKeyError()
         return derive_key(self._key, to_bytes(purpose), length)
 
+    def dilate(self):
+        from ._dilate import start_dilator
+        d, endpoints = start_dilator(self)
+        return endpoints
+
+
     def close(self):
         # fails with WormholeError unless we established a connection
         # (state=="happy"). Fails with WrongPasswordError (a subclass of
@@ -187,6 +199,9 @@ class _DeferredWormhole(object):
 
     def got_verifier(self, verifier):
         self._verifier_observer.fire_if_not_fired(verifier)
+    def got_wormhole_versions(self, our_side, their_side, wormhole_versions):
+        result = (our_side, their_side, wormhole_versions)
+        self._wormhole_versions_and_sides_observer.fire_if_not_fired(result)
     def got_versions(self, versions):
         self._version_observer.fire_if_not_fired(versions)
 

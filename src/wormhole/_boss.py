@@ -242,6 +242,8 @@ class Boss(object):
         # in the future, this is how Dilation is signalled
         self._their_side = side
         self._their_versions = bytes_to_dict(plaintext)
+        self._W.got_wormhole_versions(self._side, self._their_side,
+                                      self._their_versions)
         # but this part is app-to-app
         app_versions = self._their_versions.get("app_versions", {})
         self._W.got_versions(app_versions)

@@ -1214,6 +1214,7 @@ class Boss(unittest.TestCase):
         wormhole = Dummy("w", events, None,
                          "got_welcome",
                          "got_code", "got_key", "got_verifier", "got_versions",
+                         "got_wormhole_versions",
                          "received", "closed")
         versions = {"app": "version1"}
         reactor = None
@@ -1253,6 +1254,7 @@ class Boss(unittest.TestCase):
         b.got_message("side", "0", b"msg1")
         self.assertEqual(events, [("w.got_key", b"key"),
                                   ("w.got_verifier", b"verifier"),
+                                  ("w.got_wormhole_versions", "side", "side", {}),
                                   ("w.got_versions", {}),
                                   ("w.received", b"msg1"),
                                   ])
