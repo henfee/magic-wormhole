@@ -1,5 +1,5 @@
 from twisted.trial import unittest
-from wormhole._transit import noncebuf
+from wormhole._dilation.l2connection import noncebuf, le4, le8
 
 class Encoding(unittest.TestCase):
     def test_noncebuf(self):
