@@ -147,3 +147,7 @@ class L2Protocol(Protocol):
 
     def sendMessage(self, msg):
         self.transport.write(bytes(msg))
+
+# encryption: let's use Noise NNpsk0 (or maybe NNpsk2). That uses ephemeral
+# keys plus a pre-shared symmetric key (the Transit key), a different one for
+# each potential connection.

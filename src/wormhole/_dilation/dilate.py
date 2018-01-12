@@ -91,6 +91,10 @@ class Dilation(object):
     @m.state()
     def undecided_wanted(self): pass # pragma: no cover
 
+    # "impossible" means the other side isn't capable of dilation
+    @m.state()
+    def impossible(self): pass # pragma: no cover
+
     @m.state()
     def leader_unwanted(self): pass # pragma: no cover
     @m.state()
@@ -112,17 +116,116 @@ class Dilation(object):
     @m.state()
     def follower_connected(self): pass # pragma: no cover
 
+    # local w.dilate() causes this to trigger
     @m.input()
     def dilate(self): pass # pragma: no cover
     @m.input()
-    def rx_versions(self): pass # pragma: no cover
+    def become_leader(self): pass # pragma: no cover
+    @m.input()
+    def become_follower(self): pass # pragma: no cover
     @m.input()
     def rx_LETS_DILATE(self): pass # pragma: no cover
+
+    # Both leader and follower are given l2_connected. The leader sees this
+    # when the first connection passes negotiation.
     @m.input()
     def l2_connected(self): pass # pragma: no cover
+    # leader reacts to l2_lost
     @m.input()
     def l2_lost(self): pass # pragma: no cover
+    # follower doesn't react to l2_lost, but waits for a new LETS_DILATE
 
+    @m.output()
+    def send_lets_dilate(self):
+        pass
+
+
+    def rx_versions(self, their_side, their_versions):
+        if self._MY_SIDE > their_side:
+            self.become_leader()
+        else:
+            self.become_follower()
+
+    def rx_hints(self, n, hints):
+        if n != self.n:
+            return
+        self.rx_hints_current(hints)
+
+    @m.input()
+    def rx_hints_current(self, hints): pass # pragma: no cover
+
+    def do_leader_connect(self):
+        # send LETS-DILATE-n
+        # initiate connections?
+        # initiate listeners
+        # start sending HINTS-n
+        pass
+    def do_leader_connected(self):
+        # (send L2-you-are-winner?)
+        # drop all other connections
+        # shut down listeners
+        # L3.connected
+        # notify status delegate?
+        pass
+    def do_leader_reconnect(self):
+        # increment N
+        # notify status delegate (l2 offline)
+        # send LETS-DILATE-n
+        # initiate listeners
+        # start sending HINTS-n
+        pass
+    def do_follower_connect(self):
+        # initiate connections? (relay)
+        # initiate listeners
+        # send HINTS=n
+        pass
+    def do_follower_connected(self):
+        # drop/cancel other connections
+        # shut down listeners
+        # L3.connected
+        # notify status delegate
+        pass
+    def do_follower_disconnect(self):
+        # drop L2
+        # increment N
+        # notify status delegate
+        pass
+
+
+    undecided_unwanted.upon(become_leader, enter=leader_unwanted, outputs=[])
+    undecided_unwanted.upon(become_follower, enter=follower_unwanted, outputs=[])
+    undecided_unwanted.upon(dilate, enter=undecided_wanted)
+    undecided_wanted.upon(become_follower, enter=follower_wanted)
+    undecided_wanted.upon(become_leader, enter=leader_connecting,
+                          outputs=[do_leader_connect])
+    leader_unwanted.upon(dilate, enter=leader_connecting,
+                         outputs=[do_leader_connect])
+
+    follower_unwanted.upon(dilate, enter=follower_wanted)
+    follower_unwanted.upon(rx_LETS_DILATE, enter=follower_unwanted_but_requested)
+    follower_wanted.upon(rx_LETS_DILATE, enter=follower_connecting,
+                         outputs=[do_follower_connect])
+    follower_unwanted_but_requested.upon(dilate, enter=follower_connecting,
+                                         outputs=[do_follower_connect])
+
+    leader_connecting.upon(l2_connected, enter=leader_connected,
+                           outputs=[do_leader_connected])
+    leader_connecting.upon(rx_hints_current, enter=leader_connecting,
+                           outputs=[initiate_connections])
+    # upon(listeners ready): send HINTS-n
+    leader_connected.upon(l2_lost, enter=leader_connecting,
+                          outputs=[do_leader_reconnect])
+    leader_connected.upon(rx_hints_current, enter=leader_connected, outputs=[])
+    # upon(listeners ready): huh? too late.
+
+    follower_connecting.upon(l2_connected, enter=follower_connected,
+                             outputs=[do_follower_connected])
+    follower_connecting.upon(rx_hints_current, enter=follower_connecting,
+                             outputs=[initiate_connections])
+    follower_connected.upon(rx_hints_current, enter=follower_connected,
+                            outputs=[])
+    follower_connected.upon(l2_lost, enter=follower_connecting,
+                            outputs=[do_follower_disconnect])
 
         
     def _wait_for_l3(self):
@@ -180,3 +283,22 @@ def start_dilator(w):
     d = Dilator(w)
     endpoints = d.start()
     return endpoints
+
+# An object to manage the connection process for LETS-DILATE-n (one such object
+# per 'n').
+
+class ConnectorThingy:
+    n = attrib()
+
+    def event_rx_hints(hints): pass
+        # initiate outbound connection to each hint
+    def event_listener_ready(hint): pass
+    def event_connection_finished_negotiation(p):
+        # might cancel all orhers, or might wait for something better
+        pass
+    def event_nothing_better_timer_fired(): pass
+    def event_cancel(): pass
+
+    def output_notify_l3(): pass
+    
+    
