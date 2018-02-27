@@ -20,7 +20,6 @@ class HelloProtocol(Protocol):
 
 @inlineCallbacks
 def open(reactor, options):
-    print("options", options)
     w = create("newcli", relay_url="ws://localhost:4000/v1", reactor=reactor)
     w.set_code("4-purple-sausages")
     (control_ep, client_ep, server_ep) = yield w.dilate()
