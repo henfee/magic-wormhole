@@ -4,6 +4,9 @@ from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
 from twisted.internet.task import react
 from twisted.internet.protocol import Protocol, Factory
 from . import create
+from twisted.python import log
+import sys
+#log.startLogging(sys.stderr)
 
 class Options(usage.Options):
     pass
@@ -11,9 +14,9 @@ class Options(usage.Options):
 class HelloProtocol(Protocol):
     def connectionMade(self):
         print("connectionMade")
-        self.transport.write("hello you\n")
+        self.transport.write(b"hello you\n")
     def dataReceived(self, data):
-        print("data:", data.encode("ascii"))
+        print("data:", data)
 
 @inlineCallbacks
 def open(reactor, options):
