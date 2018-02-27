@@ -103,7 +103,8 @@ class _DelegatedWormhole(object):
 
 @implementer(IWormhole, IDeferredWormhole)
 class _DeferredWormhole(object):
-    def __init__(self, eq):
+    def __init__(self, reactor, eq):
+        self._reactor = reactor
         self._welcome_observer = OneShotObserver(eq)
         self._code_observer = OneShotObserver(eq)
         self._key = None
@@ -139,7 +140,8 @@ class _DeferredWormhole(object):
     def get_versions(self):
         return self._version_observer.when_fired()
 
-    def _get_wormhole_versions(self): # internal
+    def _get_wormhole_versions_and_sides(self): # internal
+        # fires with (our_side, their_side, their_wormhole_versions)
         return self._wormhole_versions_and_sides_observer.when_fired()
 
     def get_message(self):
@@ -169,9 +171,9 @@ class _DeferredWormhole(object):
         return derive_key(self._key, to_bytes(purpose), length)
 
     def dilate(self):
-        from ._dilate import start_dilator
-        d, endpoints = start_dilator(self)
-        return endpoints
+        from ._fake_dilate import start_dilator
+        d = start_dilator(self, self._reactor)
+        return d # fires with (endpoints)
 
 
     def close(self):
@@ -199,8 +201,9 @@ class _DeferredWormhole(object):
 
     def got_verifier(self, verifier):
         self._verifier_observer.fire_if_not_fired(verifier)
-    def got_wormhole_versions(self, our_side, their_side, wormhole_versions):
-        result = (our_side, their_side, wormhole_versions)
+    def got_wormhole_versions(self, our_side, their_side,
+                              their_wormhole_versions):
+        result = (our_side, their_side, their_wormhole_versions)
         self._wormhole_versions_and_sides_observer.fire_if_not_fired(result)
     def got_versions(self, versions):
         self._version_observer.fire_if_not_fired(versions)
@@ -242,7 +245,7 @@ def create(appid, relay_url, reactor, # use keyword args for everything else
     if delegate:
         w = _DelegatedWormhole(delegate)
     else:
-        w = _DeferredWormhole(eq)
+        w = _DeferredWormhole(reactor, eq)
     wormhole_versions = {} # will be used to indicate Wormhole capabilities
     wormhole_versions["app_versions"] = versions # app-specific capabilities
     b = Boss(w, side, relay_url, appid, wormhole_versions,
