@@ -171,8 +171,8 @@ class _DeferredWormhole(object):
         return derive_key(self._key, to_bytes(purpose), length)
 
     def dilate(self):
-        from ._fake_dilate import start_dilator
-        d = start_dilator(self, self._reactor)
+        from ._fake_dilate import start_dilation
+        d = start_dilation(self, self._reactor)
         return d # fires with (endpoints)
 
 

@@ -53,7 +53,6 @@ class L3Connection(object):
 
     @m.output()
     def start_connecting(self, l2):
-        if 
         pass
 
     @m.output()
