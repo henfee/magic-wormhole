@@ -1,14 +1,36 @@
+# Dilation Internals
 
-The side with the lexicographically-higher "side" value is named the
-"Leader". The other side is named the "Follower". The general wormhole
-protocol treats both sides identically, but the distinction matters for the
-dilation protocol. Either side can trigger dilation, but the Follower does so
-by asking the Leader to start the process, whereas the Leader just starts the
-process unilaterally. The Leader has exclusive control over whether a given
+Wormhole dilation involves several moving parts. Both sides exchange messages
+through the Mailbox server to coordinate the establishment of a more direct
+connection. This connection might flow in either direction, so they trade
+"connection hints" to point at potential listening ports. This process might
+succeed in making multiple connections at about the same time, so one side
+must select the best one to use, and cleanly shut down the others. To make
+the dilated connection *durable*, this side must also decide when the
+connection has been lost, and then coordinate the construction of a
+replacement. Within this connection, a series of queued-and-acked subchannel
+messages are used to open/use/close the application-visible subchannels.
+
+## Leaders and Followers
+
+Each side of a Wormhole has a randomly-generated "side" string. When the
+wormhole is dilated, the side with the lexicographically-higher "side" value
+is named the "Leader", and the other side is named the "Follower". The general
+wormhole protocol treats both sides identically, but the distinction matters
+for the dilation protocol.
+
+Either side can trigger dilation, but the Follower does so by asking the
+Leader to start the process, whereas the Leader just starts the process
+unilaterally. The Leader has exclusive control over whether a given
 connection is considered established or not: if there are multiple potential
 connections to use, the Leader decides which one to use, and the Leader gets
 to decide when the connection is no longer viable (and triggers the
 establishment of a new one).
+
+## Connection Layers
+
+We describe the protocol as a series of layers. Messages sent on one layer
+may be encoded or transformed before being delivered on some other layer.
 
 L1 is the mailbox channel. Both clients remain connected to the mailbox
 server, and send DILATE(gen=N) and PLEASE-DILATE() messages through the
@@ -19,17 +41,17 @@ L2 is the set of competing connection attempts for a given generation of
 connection. Each time the Leader decides to establish a new connection, a new
 generation number is used. Hopefully these are direct TCP connections between
 the two peers, but they may also include connections through the transit
-relay. Each connection must go through a handshake process before it is
-considered viable. Viable connections are then submitted to a selection
+relay. Each connection must go through an encrypted handshake process before
+it is considered viable. Viable connections are then submitted to a selection
 process (on the Leader side), which chooses exactly one to use, and drops the
 others. It may wait an extra few seconds in the hopes of getting a "better"
 connection (faster, cheaper, etc), but eventually it will select one.
 
 L3 is the current selected connection. At all times, the wormhole will have
-exactly zero or one L3 connection. Each L3 uses a distinct Noise session
-(started during the handshake process), using the NNpsk0 pattern, with the
-Leader as the first party ("-> psk, e" in the Noise spec), and the Follower
-as the second ("<- e, ee").
+exactly zero or one L3 connection. L3 is responsible for the selection
+process, connection monitoring/keepalives, and serialization/deserialization
+of the plaintext frames. L3 delivers decoded frames and
+connection-establishment events up to L4.
 
 L4 is the persistent higher-level channel. It is created as soon as the first
 L3 connection is selected, and lasts until wormhole is closed entirely. L4
@@ -68,44 +90,271 @@ the connection will be dropped. For debugging purposes, the node might want
 to keep looking at data beyond the first incorrect character and log
 everything until the first newline.
 
-Everything beyond that point is a Noise protocol message, which use a 4-byte
-big-endian length field, followed by some number of bytes. The Leader sends
-the first message, which is a psk-encrypted ephemeral key. The Follower sends
-the next message, its own psk-encrypted ephemeral key. The Follower then
-sends an empty packet as the "key confirmation message", which will be
-encrypted by the shared key.
+Everything beyond that point is a Noise protocol message, which consists of a
+4-byte big-endian length field, followed by the indicated number of bytes.
+This ises the `NNpsk0` pattern with the Leader as the first party ("-> psk,
+e" in the Noise spec), and the Follower as the second ("<- e, ee"). The
+pre-shared-key is the "dilation key", which is statically derived from the
+master PAKE key using HKDF. Each L2 connection uses the same dilation key,
+but different ephemeral keys, so each gets a different session key.
+
+The Leader sends the first message, which is a psk-encrypted ephemeral key.
+The Follower sends the next message, its own psk-encrypted ephemeral key. The
+Follower then sends an empty packet as the "key confirmation message", which
+will be encrypted by the shared key.
 
 The Leader sees the KCM and knows the connection is viable. It delivers the
-protocol object to the Dilation manager, which will decide which connection
-to select. When the L2 connection is selected to be the new L3, it will send
-an empty KCM of its own, to let the Follower know the connection being
-selected. All other L2 connections (either viable or still in handshake) are
-dropped, all other connection attempts are cancelled, and all listening
-sockets are shut down.
+protocol object to the L3 manager, which will decide which connection to
+select. When the L2 connection is selected to be the new L3, it will send an
+empty KCM of its own, to let the Follower know the connection being selected.
+All other L2 connections (either viable or still in handshake) are dropped,
+all other connection attempts are cancelled, and all listening sockets are
+shut down.
 
 The Follower will wait for either an empty KCM (at which point the L2
 connection is delivered to the Dilation manager as the new L3), a
 disconnection, or an invalid message (which causes the connection to be
 dropped). Other connections and/or listening sockets are stopped.
 
+Internally, the L2Protocol object manages the Noise session itself. It knows
+(via a constructor argument) whether it is on the Leader or Follower side,
+which affects both the role is plays in the Noise pattern, and the reaction
+to receiving the ephemeral key (for which only the Follower sends an empty
+KCM message). After that, the L2Protocol notifies the L3 object in three
+situations:
+
+* the Noise session produces a valid decrypted frame (for Leader, this
+  includes the Follower's KCM, and thus indicates a viable candidate for
+  connection selection)
+* the Noise session reports a failed decryption
+* the TCP session is lost
+
+All notifications include a reference to the L2Protocol object (`self`). The
+L3 object uses this reference to either close the connection (for errors or
+when the selection process chooses someone else), to send the KCM message
+(after selection, only for the Leader), or to send other L4 messages. The L3
+object will retain a reference to the winning L2 object.
+
+## L3 protocol
+
+The L3 layer is responsible for connection selection, monitoring/keepalives,
+and message (de)serialization. Framing is handled by L2, so the inbound L3
+codepath receives single-message bytestrings, and delivers the same down to
+L2 for encryption, framing, and transmission.
+
+Connection selection takes place exclusively on the Leader side, and includes
+the following:
+
+* receipt of viable L2 connections from below (indicated by the first valid
+  decrypted frame received for any given connection)
+* expiration of a timer
+* comparison of TBD quality/desirability/cost metrics of viable connections
+* selection of winner
+* instructions to losing connections to disconnect
+* delivery of KCM message through winning connection
+* retain reference to winning connection
+
+On the Follower side, the L3 manager just waits for the first connection to
+receive the Leader's KCM, at which point it is retained and all others are
+dropped.
+
+The L3 manager knows which "generation" of connection is being established.
+Each generation uses a different dilation key (?), and is triggered by a new
+set of L1 messages. Connections from one generation should not be confused
+with those of a different generation.
+
+Each time a new L3 connection is established, the L4 protocol is notified. It
+will will immediately send all the L4 messages waiting in its outbound queue.
+The L3 protocol simply wraps these in Noise frames and sends them to the
+other side.
+
+The L3 manager monitors the viability of the current connection, and declares
+it as lost when bidirectional traffic cannot be maintained. It uses PING and
+PONG messages to detect this. These also serve to keep NAT entries alive,
+since many firewalls will stop forwarding packets if they don't observe any
+traffic for e.g. 5 minutes.
+
+Our goals are:
+
+* don't allow more than 30? seconds to pass without at least *some* data
+  being sent along each side of the connection
+* allow the Leader to detect silent connection loss within 60? seconds
+* minimize overhead
+
+We need both sides to:
+
+* maintain a 30-second repeating timer
+* set a flag each time we write to the connection
+* each time the timer fires, if the flag was clear then send a PONG,
+  otherwise clear the flag
+
+In addition, the Leader must:
+
+* run a 60-second repeating timer (ideally somewhat offset from the other)
+* set a flag each time we receive data from the connection
+* each time the timer fires, if the flag was clear then drop the connection,
+  otherwise clear the flag
+
+In the future, we might have L2 links that are less connection-oriented,
+which might have a unidirectional failure mode, at which point we'll need to
+monitor full roundtrips. To accomplish this, the Leader will send periodic
+unconditional PINGs, and the Follower will respond with PONGs. If the
+Leader->Follower connection is down, the PINGs won't arrive and no PONGs will
+be produced. If the Follower->Leader direction has failed, the PONGs won't
+arrive. The delivery of both will be delayed by actual data, so the timeouts
+should be adjusted if we see regular data arriving.
+
+If the connection is dropped before the wormhole is closed (either the other
+end explicitly dropped it, we noticed a problem and told TCP to drop it, or
+TCP noticed a problem itself), the Leader-side L3 manager will initiate a
+reconnection attempt. This uses L1 to send a new DILATE message through the
+mailbox server, along with new connection hints. Eventually this will result
+in a new L3 connection being established.
+
+Finally, L3 is responsible for message serialization and deserialization. L2
+performs decryption and delivers plaintext frames to L3. Each frame starts
+with a one-byte type indicator. The rest of the message depends upon the
+type:
+
+* 0x00 PING, 4-byte ping-id
+* 0x01 PONG, 4-byte ping-id
+* 0x02 OPEN, 4-byte subchannel-id, 4-byte seqnum
+* 0x03 DATA, 4-byte subchannel-id, 4-byte seqnum, variable-length payload
+* 0x04 CLOSE, 4-byte subchannel-id, 4-byte seqnum
+* 0x05 ACK, 4-byte response-seqnum
+
+All seqnums are big-endian, and are provided by the L4 protocol. The other
+fields are arbitrary and not interpreted as integers. The subchannel-ids must
+be allocated by both sides without collision, but otherwise they are only
+used to look up L5 objects for dispatch. The response-seqnum is always copied
+from the OPEN/DATA/CLOSE packet being acknowledged.
+
+L3 consumes the PING and PONG messages. Receiving any PING will provoke a
+PONG in response, with a copy of the ping-id field. The 30-second timer will
+produce unprovoked PONGs with a ping-id of all zeros. A future viability
+protocol will use PINGs to test for roundtrip functionality.
+
+All other messages (OPEN/DATA/CLOSE/ACK) are deserialized and delivered
+"upstairs" to the L4 protocol handler.
+
+The current L3 connection's `IProducer`/`IConsumer` interface is made
+available to the L4 flow-control manager.
+
 ## L4 protocol
 
 The L4 protocol manages a durable stream of OPEN/DATA/CLOSE/ACK messages.
-Each is enclosed in a Noise frame, so they do not need length fields or other
-framing.
+Since each will be enclosed in a Noise frame before they pass to L3, they do
+not need length fields or other framing.
 
-Subchannel numbers are 4-byte big-endian integers, and are present in
-OPEN/DATA/CLOSE but not ACK. Sequence numbers are 4-byte big-endian integers
-and are present in OPEN/DATA/CLOSE. Acknowledged sequence numbers are also
-4-byte big-endian integers and are only present in ACK messages: they refer
-to the seqnum in a matching OPEN/DATA/CLOSE from the other direction, rather
-than indicating anything about the ACK message itself. ACKs are not acked.
+Each OPEN/DATA/CLOSE has a sequence number, starting at 0, and monotonically
+increasing by 1 for each message. Each direction has a separate number space.
 
-All L4 messages are retained until a matching ACK from the other side has
-been received. If there is no L3 connection available when the L4 message is
-presented for transmission, it will be queued until one becomes available.
-Consequently the L4 ``send()`` function always appends the message onto a
-double-ended queue, and additionally sends it if an L3 connection is present.
-If and when the ACK arrives, the message is removed from the other end. On
-any given L3 connection, all messages are sent in-order.
+The L4 manager maintains a double-ended queue of unacknowledged outbound
+messages. Subchannel activity (opening, closing, sending data) cause messages
+to be added to this queue. If an L3 connection is available, these messages
+are also sent over that connection, but they remain in the queue in case the
+connection is lost and they must be retransmitted on some future replacement
+connection. Messages stay in the queue until they can be retired by the
+receipt of an ACK with a matching response-sequence-number. This provides
+reliable message delivery that survives the L3 connection being replaced.
 
+ACKs are not acked, nor do they have seqnums of their own.
+
+Each time an L3 connection is established, the side will immediately send all
+L4 messages waiting in the outbound queue. A future protocol might reduce
+this duplication by including the highest received sequence number in the L1
+PLEASE-DILATE message, which would effectively retire queued messages before
+initiating the L2 connection process. On any given L3 connection, all
+messages are sent in-order. The receipt of an ACK for seqnum `N` allows all
+messages with `seqnum <= N` to be retired.
+
+The L4 layer is also responsible for managing flow control among the L3
+connection and the various L5 subchannels.
+
+## L5 subchannels
+
+The L5 layer consists of a collection of "subchannel" objects, a dispatcher,
+and the endpoints that provide the Twisted-flavored API.
+
+Other than the "control channel", all subchannels are created by a client
+endpoint connection API. The side that calls this API is named the Initiator,
+and the other side is named the Acceptor. Subchannels can be initiated in
+either direction, independent of the Leader/Follower distinction. For a
+typical file-transfer application, the subchannel would be initiated by the
+side seeking to send a file.
+
+Each subchannel uses a distinct subchannel-id, which is a four-byte
+identifier. Both directions share a number space (unlike L4 seqnums), so the
+rule is that the Leader side sets the last bit of the last byte to a 0, while
+the Follower sets it to a 1. These are not generally treated as integers,
+however for the sake of debugging, the implementation generates them with a
+simple big-endian-encoded counter (`next(counter)*2` for the Leader,
+`next(counter)*2+1` for the Follower).
+
+When the `client_ep.connect()` API is called, the Initiator allocates a
+subchannel-id and sends an OPEN. It can then immediately send DATA messages
+with the outbound data (there is no special response to an OPEN, so there is
+no need to wait). The Acceptor will trigger their `.connectionMade` handler
+upon receipt of the OPEN.
+
+Subchannels are durable: they do not close until one side calls
+`.loseConnection` on the subchannel object (or the enclosing Wormhole is
+closed). Either the Initiator or the Acceptor can call `.loseConnection`.
+This causes a CLOSE message to be sent (with the subchannel-id). The other
+side will send its own CLOSE message in response. Each side will signal the
+`.connectionLost()` event upon receipt of a CLOSE.
+
+There is no equivalent to TCP's "half-closed" state, however if only one side
+calls `close()`, then all data written before that call will be delivered
+before the other side observes `.connectionLost()`. Any inbound data that was
+queued for delivery before the other side sees the CLOSE will still be
+delivered to the side that called `close()` before it sees
+`.connectionLost()`. Internally, the side which called `.loseConnection` will
+remain in a special "closing" state until the CLOSE response arrives, during
+which time DATA payloads are still delivered. After calling `close()` (or
+receiving CLOSE), any outbound `.write()` calls will trigger an error.
+
+DATA payloads that arrive for a non-open subchannel are logged and discarded.
+
+This protocol calls for one OPEN and two CLOSE messages for each subchannel,
+with some arbitrary number of DATA messages in between. Subchannel-ids should
+not be reused (it would probably work, the protocol hasn't been analyzed
+enough to be sure).
+
+The "control channel" is special. It uses a subchannel-id of all zeros, and
+is opened implicitly by both sides as soon as the first L3 connection is
+selected. It is routed to a special client-on-both-sides endpoint, rather
+than causing the listening endpoint to accept a new connection. This avoids
+the need for application-level code to negotiate who should be the one to
+open it (the Leader/Follower distinction is private to the Wormhole
+internals: applications are not obligated to pick a side).
+
+OPEN and CLOSE messages for the control channel are logged and discarded. The
+control-channel client endpoints can only be used once, and does not close
+until the Wormhole itself is closed.
+
+Each OPEN/DATA/CLOSE message is delivered to the L4 object for queueing,
+delivery, and eventual retirement. The L5 layer does not keep track of old
+messages.
+
+### Flow Control
+
+Subchannels are flow-controlled by pausing their writes when the L3
+connection is paused, and pausing the L3 connection when the subchannel
+signals a pause. When the outbound L3 connection is full, *all* subchannels
+are paused. Likewise the inbound connection is paused if *any* of the
+subchannels asks for a pause. This is much easier to implement and improves
+our utilization factor (we can use TCP's window-filling algorithm, instead of
+rolling our own), but will block all subchannels even if only one of them
+gets full. This shouldn't matter for many applications, but might be
+noticeable when combining very different kinds of traffic (e.g. a chat
+conversation sharing a wormhole with file-transfer might prefer the IM text
+to take priority).
+
+Each subchannel implements Twisted's `ITransport`, `IProducer`, and
+`IConsumer` interfaces. The Endpoint API causes a new `IProtocol` object to
+be created (by the caller's factory) and glued to the subchannel object in
+the `.transport` property, as is standard in Twisted-based applications.
+
+All subchannels are also paused when the L3 connection is lost, and are
+unpaused when a new replacement connection is selected.

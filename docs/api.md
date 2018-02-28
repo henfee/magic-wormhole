@@ -532,9 +532,9 @@ All wormholes start out "undilated". In this state, all messages are queued
 on the Rendezvous Server for the lifetime of the wormhole, and server-imposed
 number/size/rate limits apply. Calling `w.dilate()` initiates the dilation
 process, and eventually yields a set of Endpoints. Once dilated, the usual
-`.send_message()`/`.get_message()` APIs are disabled, and these endpoints can
-be used to establish multiple (encrypted) "subchannel" connections to the
-other side.
+`.send_message()`/`.get_message()` APIs are disabled (TODO: really?), and
+these endpoints can be used to establish multiple (encrypted) "subchannel"
+connections to the other side.
 
 Each subchannel behaves like a regular Twisted `ITransport`, so they can be
 glued to the Protocol instance of your choice. They also implement the
@@ -591,8 +591,9 @@ can be established by either side at any time. This supports e.g.
 bidirectional file transfer, where either user of a GUI app can drop files
 into the "wormhole" whenever they like.
 
-The `subchannel_client_ep` is used by one side to connect to the other side's
-`subchannel_server_ep`. The client endpoint is reusable.
+The `subchannel_client_ep` on one side is used to connect to the other side's
+`subchannel_server_ep`, and vice versa. The client endpoint is reusable. The
+server endpoint is single-use: `.listen(factory)` may only be called once.
 
 Applications are under no obligation to use subchannels: for many use cases,
 the control channel is enough.
@@ -631,11 +632,12 @@ def FileSendingProtocol(internet.Protocol):
     def connectionMade(self):
         self.transport.write(self.file_metadata)
         sender = protocols.basic.FileSender()
-        with open(self.file_name,"rb") as f:
-            d = sender.beginFileTransfer(f, self.transport)
-        d.addCallback(self._done)
-    def _done(res):
+        f = open(self.file_name,"rb")
+        d = sender.beginFileTransfer(f, self.transport)
+        d.addBoth(self._done, f)
+    def _done(res, f):
         self.transport.loseConnection()
+        f.close()
 def _send(metadata, filename):
     f = protocol.ClientCreator(reactor, 
                                FileSendingProtocol, metadata, filename)
@@ -657,54 +659,6 @@ def _dilated(res):
     f = Factory(FileReceivingProtocol)
     subchannel_server_ep.listen(f)
 ```
-
-### Dilation Internals
-
-Each side of a Wormhole has a randomly-generated "side" string. When the
-wormhole is dilated, the side with a larger value is named the "Decider", and
-the other side becomes the "Follower". 
-
-Internally, the TCP connection carries "Transit" messages of various types,
-all encrypted with keys derived from the main wormhole key.
-
-* ping/pong: used to determine if the connection is still open
-* open subchannel N
-* data for subchannel N (4-byte big-endian length field, 4-byte seqnum)
-* ack for data on subchannel N (4-byte seqnum)
-* close subchannel N (seqnum?)
-
-The Decider determines when a connection is viable or not, by sending a
-periodic Ping message (when no other traffic is being sent). The Follower
-sends a periodic Pong if and only if it sees incoming traffic (including
-Pings). If the Decider doesn't see any incoming traffic for a while, it
-declares the connection dead, drops the transport, and uses the Rendezvous
-mailbox to initiate a new connection attempt. The idea is to discover
-bidirectional or unidirectional failures.
-
-The subchannel identifiers are 8-byte big-endian numbers, with even integers
-for subchannels opened by the Decider, and odd integers for the Follower.
-Both sides can send an open() at any time. There is no specific response to
-the open(): data can follow immediately.
-
-ack() is intended to provide reliable delivery of data despite the TCP
-connection being replaceable. TODO: ack the open, or have the sender
-re-transmit with each new TCP connection. TODO: figure out a sliding window
-size to manage buffering (how much data is the sender allowed to write before
-waiting for an ack?).
-
-The "control channel" uses a special subchannel 0. It is automatically opened
-when the transit is established. This avoids the need for the
-application-level code to negotiate who should open it. It does not close
-until the Wormhole itself is closed (despite the comings and goings of the
-underlying TCP connection).
-
-Subchannels (including the control channel) are durable: they do not close
-until one side calls `.loseConnection()` on the subchannel, or the enclosing
-Wormhole is closed. There is no "half-closed state", however if only one side
-calls `close()`, then all data written before that call will be delivered
-before the other side observes `.connectionLost()`. Any inbound data that was
-queued for delivery will be discarded the moment you call `close()`.
-
 
 ## Bytes, Strings, Unicode, and Python 3
 
