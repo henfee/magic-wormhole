@@ -2,11 +2,39 @@
 class SingleUseEndpointError(Exception):
     pass
 
+# created in the (OPEN) state, by either:
+#  * receipt of an OPEN message
+#  * or local client_endpoint.connect()
+# then transitions are:
+# (OPEN) rx DATA: deliver .dataReceived(), -> (OPEN)
+# (OPEN) rx CLOSE: deliver .connectionLost(), send CLOSE, -> (CLOSED)
+# (OPEN) local .write(): send DATA, -> (OPEN)
+# (OPEN) local .loseConnection(): send CLOSE, -> (CLOSING)
+# (CLOSING) local .write(): error
+# (CLOSING) local .loseConnection(): error
+# (CLOSING) rx DATA: deliver .dataReceived(), -> (CLOSING)
+# (CLOSING) rx CLOSE: deliver .connectionLost(), -> (CLOSED)
+# object is deleted upon transition to (CLOSED)
+
+class AlreadyClosedError(Exception):
+    pass
+
+@implementer(IAddress)
+class _SubchannelAddress(object):
+    pass
+
+
 @attrs
+@implementer(ITransport)
+@implementer(IProducer)
+@implementer(IConsumer)
 @implementer(_interfaces.ISubChannel)
 class SubChannel(object):
     _id = attrib(validator=int)
     _l3 = attrib(validator=instance_of(L3Connection))
+    _l4 = attrib(validator=instance_of(L4Connection))
+    _host_addr = attrib(validator=instance_of(_SubchannelAddress))
+    _peer_addr = attrib(validator=instance_of(_SubchannelAddress))
 
     m = MethodicalMachine()
     set_trace = getattr(m, "_setTrace", lambda self, f: None)
@@ -18,9 +46,6 @@ class SubChannel(object):
         pass
 
     @m.state(initial=True)
-    def idle(self): pass # pragma: no cover
-
-    @m.state()
     def open(self): pass # pragma: no cover
 
     @m.state()
@@ -29,138 +54,64 @@ class SubChannel(object):
     @m.state()
     def closed(): pass # pragma: no cover
 
-
-    @m.input()
-    def remote_open(self): pass
     @m.input()
     def remote_data(self, data): pass
+    @m.input()
+    def remote_close(self): pass
+
     @m.input()
     def local_data(self, data): pass
     @m.input()
     def local_close(self): pass
-    @m.input()
-    def remote_close(self): pass
 
 
-    @m.output()
-    def send_close(self):
-        self._l3.sendClose(self._id)
-
-    # things that can happen when idle
-    @m.output()
-    def error_early_remote_data(self, data):
-        raise Error
-    @m.output()
-    def error_early_local_data(self, data):
-        raise Error
-    @m.output()
-    def error_early_local_close(self):
-        raise Error
-    @m.output()
-    def error_early_remote_close(self):
-        raise Error
-
-
-    # things that can happen while open
-    @m.output()
-    def error_double_remote_open(self):
-        raise Error
-    @m.output()
-    def accept_data(self, data):
-        XXX
     @m.output()
     def send_data(self, data):
-        XXX
+        self._l4.sendData(self._id, data)
+
     @m.output()
     def send_close(self):
-        XXX
-    @m.output()
-    def send_close_and_close_subchannel(self):
-        XXX
+        self._l4.sendClose(self._id)
 
+    @m.output()
+    def signal_loseConnection(self):
+        self._protocol.loseConnection(what)
+        self._l4.subchannel_closed(self)
+        # we're deleted momentarily
 
-    # things that can happen while closing
     @m.output()
-    def error_double_remote_open(self):
-        raise Error
-    @m.output()
-    def ignore_remote_data(self, data):
-        pass
-    @m.output()
-    def error_late_local_data(self, data):
-        raise Error
-    @m.output()
-    def error_double_local_close(self):
-        raise Error
-    @m.output()
-    def finished_closing(self):
-        XXX
+    def signal_dataReceived(self, data):
+        self._protocol.dataReceived(data)
 
-
-    # things that can happen while closed
     @m.output()
-    def error_reopened(self):
-        raise Error
-    @m.output()
-    def error_late_remote_data(self, data):
-        raise Error
-    @m.output()
-    def error_late_local_data(self, data):
-        raise Error
-    @m.output()
-    def error_late_local_close(self):
-        raise Error
-    @m.output()
-    def error_late_remote_close(self):
-        raise Error
+    def error_closed(self):
+        raise AlreadyClosedError("write/loseConnection not allowed on closed subchannel")
 
     # primary transitions
-    idle.upon(remote_open, enter=open, outputs=[])
-    open.upon(remote_data, enter=open, outputs=[accept_data])
+    open.upon(remote_data, enter=open, outputs=[signal_dataReceived])
     open.upon(local_data, enter=open, outputs=[send_data])
-    open.upon(remote_close, enter=closed, outputs=[send_close_and_close_subchannel])
+    open.upon(remote_close, enter=closed, outputs=[signal_loseConnection])
     open.upon(local_close, enter=closing, outputs=[send_close])
-    closing.upon(remote_close, enter=closed, outputs=[finished_closing])
+    closing.upon(remote_data, enter=closing, outputs=[signal_dataReceived])
+    closing.upon(remote_close, enter=closed, outputs=[signal_loseConnection])
 
     # error cases
-    idle.upon(remote_data, enter=idle, outputs=[error_early_remote_data])
-    idle.upon(local_data, enter=idle, outputs=[error_early_local_data])
-    idle.upon(local_close, enter=idle, outputs=[error_early_local_close])
-    idle.upon(remote_close, enter=idle, outputs=[error_early_remote_close])
-    open.upon(remote_open, enter=open, outputs=[error_double_remote_open])
-    closing.upon(remote_open, enter=closing, outputs=[error_double_remote_open])
-    closing.upon(remote_data, enter=closing, outputs=[ignore_remote_data])
-    closing.upon(local_data, enter=closing, outputs=[error_late_local_data])
-    closing.upon(local_close, enter=closing, outputs=[error_double_local_close])
-    closed.upon(remote_open, enter=closed, outputs=[error_reopened])
-    closed.upon(remote_data, enter=closed, outputs=[error_late_remote_data])
-    closed.upon(local_data, enter=closed, outputs=[error_late_local_data])
-    closed.upon(local_close, enter=closed, outputs=[error_late_local_close])
-    closed.upon(remote_close, enter=closed, outputs=[error_late_remote_close])
+    # we won't ever see an OPEN, since L4 will log+ignore those for us
+    closing.upon(local_data, enter=closing, outputs=[error_closed])
+    closing.upon(local_close, enter=closing, outputs=[error_closed])
+    # the CLOSED state won't ever see messages, since we'll be deleted
 
-
-
-@attrs
-@implementer(ITransport)
-@implementer(IProducer)
-@implementer(IConsumer)
-class Subchannel(object):
-    _l3 = attrib(validator=instance_of(L3Connection))
-    _l4 = attrib(validator=instance_of(SubChannel))
-
-    def __attrs_post_init__(self):
-        pass
-
+    # ITransport
     def write(self, data):
-        self._l4.local_data(data)
+        self.local_data(data)
     def writeSequence(self, iovec):
         self.write(b"".join(iovec))
     def loseConnection(self):
-        self._l4.local_close()
-    def getPeer(self):
-        return None # XXX
+        self.local_close()
     def getHost(self):
-        return None # XXX
+        return self._host_addr
+    def getPeer(self):
+        return self._peer_addr
 
     # IProducer
     def stopProducing(self):
@@ -178,10 +129,6 @@ class Subchannel(object):
     def unregisterProducer(self):
         pass
 
-
-@implementer(IAddress)
-class _SubchannelAddress(object):
-    pass
 
 @implementer(IStreamClientEndpoint)
 @attrs

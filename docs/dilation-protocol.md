@@ -258,7 +258,14 @@ connection. Messages stay in the queue until they can be retired by the
 receipt of an ACK with a matching response-sequence-number. This provides
 reliable message delivery that survives the L3 connection being replaced.
 
-ACKs are not acked, nor do they have seqnums of their own.
+ACKs are not acked, nor do they have seqnums of their own. Each inbound side
+remembers the highest ACK it has sent, and ignores incoming OPEN/DATA/CLOSE
+messages with that sequence number or higher. This ensures in-order
+at-most-once processing of OPEN/DATA/CLOSE messages.
+
+Each inbound OPEN message causes a new L5 subchannel object to be created.
+Subsequent DATA/CLOSE messages for the same subchannel-id are delivered to
+that object.
 
 Each time an L3 connection is established, the side will immediately send all
 L4 messages waiting in the outbound queue. A future protocol might reduce
