@@ -132,6 +132,9 @@ class L2Protocol(Protocol):
             self._buffer = self._buffer[4+frame_length:] # TODO: avoid copy
             self.got_frame(frame)
 
+    def connectionLost(self, why=None):
+        self._l3.lost_connection(self)
+
     def pauseProducing(self):
         # TODO: only do this if we're the active one. OTOH, if we aren't the
         # active one, we shouldn't be sending so much data that we'll be told
@@ -144,6 +147,11 @@ class L2Protocol(Protocol):
         # the L3 unless we're the active one.
         self._l3.resumeProducing()
 
+    # from L3 above
     def encrypt_and_send(self, payload):
         frame = self._noise.send(payload)
         self.transport.write(frame)
+
+    def disconnect(self):
+        self.transport.loseConnection()
+

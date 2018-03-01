@@ -18,10 +18,15 @@ def encode(m):
 
 # message queue, ack, dispatch
 class L4(object):
-    def __init__(self):
+    def __init__(self, eventual_queue):
         self._outbound_queue = deque()
         self._next_outbound_seqnum = 0
         self._highest_inbound_acked = -1
+        self._made_first_connection = False
+        self._first_connected = OneShotObserver(eventual_queue)
+
+    def when_first_connected(self):
+        return self._first_connected.when_fired()
 
     def _get_next_seqnum(self):
         seqnum = self._next_outbound_seqnum
@@ -151,12 +156,62 @@ class L4(object):
             self._l3.encrypt_and_send(encode(m))
         for t in self._subchannels.values():
             t.resumeProducing()
+        if not self._made_first_connection:
+            self._made_first_connection = True
+            self._first_connected.fire(None)
 
     def l3_disconnected(self):
         assert self._l3
         self._l3 = None
         for t in self._subchannels.values():
             t.pauseProducing()
+        if self._role is LEADER and self._active:
+            self._gm.lost()
+
+# the GenerationManager only exists on the Leader side, not the Follower
+@attrs
+class GenerationManager:
+    _l1 = attrib(validator=instance_of(IWormhole))
+    _l4 = attrib(validator=instance_of(L4Connection))
+    _next_generation = 0
+    m = MethodicalMachine()
+    set_trace = getattr(m, "_setTrace", lambda self, f: None)
+
+    @m.state(initial=True)
+    def idle(self): pass # pragma: no cover
+    @m.state()
+    def waiting(self): pass # pragma: no cover
+    @m.state()
+    def active(self): pass # pragma: no cover
+
+    @m.input()
+    def start(self):
+        pass
+    @m.input()
+    def got_ok(self):
+        pass
+    @m.input()
+    def lost(self):
+        pass
+
+    @m.output()
+    def send_start(self):
+        if self._l3:
+            # make sure all previous connections (established and pending) are
+            # stopped
+            self._l3.shutdown()
+        gen = self._next_generation
+        self._next_generation += 1
+        self._l1.send_dilate("start-dilation", version="1", generation=gen)
+
+    @m.output()
+    def start_connecting(self):
+        pass
+
+    idle.upon(start, enter=waiting, outputs=[send_start])
+    waiting.upon(got_ok, enter=active, outputs=[start_connecting])
+    active.upon(lost, enter=waiting, outputs=[send_start])
+
 
 # TODO: flow control routing
 

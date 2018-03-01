@@ -11,8 +11,6 @@ class L3Connection(object):
 
     _wormhole = attrib(validator=instance_of(IWormhole))
     _is_leader = attrib(validator=instance_of(bool))
-    _inbound_box = attrib(validator=instance_of(SecretBox))
-    _outbound_box = attrib(validator=instance_of(SecretBox))
 
     m = MethodicalMachine()
     set_trace = getattr(m, "_setTrace", lambda self, f: None)
@@ -127,16 +125,53 @@ class L3Connection(object):
 
     # from l2
     def bad_frame(self, l2):
-        pass
+        if self._selected_l2 is None:
+            # well, we certainly aren't selecting this one
+            l2.disconnect()
+        else:
+            # make it go away. if that was our selected L2, this will start a
+            # new generation
+            l2.disconnect()
 
     def good_frame(self, l2, payload):
-        pass
+        if self._selected_l2 is None:
+            # we're waiting for selection to complete
+            # if we're the leader, this could be a KCM frame from a new L2
+            if self._role is LEADER:
+                if payload != b"":
+                    log.err("weird, Follower's KCM wasn't empty")
+                self._add_l2_candidate(l2)
+            if self._role is FOLLOWER:
+                # as follower, we expect to see one KCM frame from the selected
+                # L2, and silence from the rest. So use the L2 for the first
+                # good frame we get.
+                if payload != b"":
+                    log.err("weird, Leader's KCM wasn't empty")
+                self._accept_l2(l2)
+        else:
+            self._l3.got_message(payload)
+
+    def lost_connection(self, l2):
+        if l2 is self._selected_l2:
+            self._l4.l3_disconnected()
 
     def pauseProducing(self):
         self._l4.pauseProducing()
 
     def resumeProducing(self):
         self._l4.resumeProducing()
+
+    def _add_l2_candidate(self, l2):
+        self._l2_candidates.add(l2)
+        # for now, just accept the first one
+        self._accept_l2(l2)
+
+    def _accept_l2(self, l2):
+        self._selected_l2 = l2
+        self._l3_connected()
+
+    def _l3_connected(self):
+        self._l4.l3_connected()
 
     # from L4
 

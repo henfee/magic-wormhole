@@ -49,11 +49,11 @@ process (on the Leader side), which chooses exactly one to use, and drops the
 others. It may wait an extra few seconds in the hopes of getting a "better"
 connection (faster, cheaper, etc), but eventually it will select one.
 
-L3 is the current selected connection. At all times, the wormhole will have
-exactly zero or one L3 connection. L3 is responsible for the selection
-process, connection monitoring/keepalives, and serialization/deserialization
-of the plaintext frames. L3 delivers decoded frames and
-connection-establishment events up to L4.
+L3 is the current selected connection. There is one L3 for each generation.
+At all times, the wormhole will have exactly zero or one L3 connection. L3 is
+responsible for the selection process, connection monitoring/keepalives, and
+serialization/deserialization of the plaintext frames. L3 delivers decoded
+frames and connection-establishment events up to L4.
 
 L4 is the persistent higher-level channel. It is created as soon as the first
 L3 connection is selected, and lasts until wormhole is closed entirely. L4
@@ -180,6 +180,17 @@ upon receipt of the hints.
   "hints": [ ... ]
 }
 ```
+
+Hints can arrive at any time. One side might immediately send hints that can
+be computed quickly, then send additional hints later as they become
+available. For example, it might enumerate the local network interfaces and
+send hints for all of the LAN addresses first, then send port-forwarding
+(UPnP) requests to the local router. When the forwarding is established
+(providing an externally-visible IP address and port), it can send additional
+hints for that new endpoint. If the other peer happens to be on the same LAN,
+the local connection can be established without waiting for the router's
+response.
+
 
 ### Connection Hint Format
 

@@ -302,3 +302,61 @@ class ConnectorThingy:
     def output_notify_l3(): pass
     
     
+LEADER, FOLLOWER = object(), object()
+
+@attrs
+class Dilation(object):
+    _wormhole = attrib(validator=instance_of(IWormhole))
+
+    def __attrs_post_init__(self):
+        pass
+
+    # from wormhole
+
+    @inlineCallbacks
+    def dilate(self, eventual_queue):
+        # called when w.dilate() is invoked
+        res = yield self._wormhole._get_wormhole_versions_and_sides()
+        (our_side, their_side, their_wormhole_versions) = res
+        self._my_role = LEADER if our_side > their_side else FOLLOWER
+        #self._l3 = L3Connection(self._wormhole, self._my_role is LEADER)
+        self._l4 = L4(eventual_queue)
+        if self._my_role is LEADER:
+            gm = GenerationManager(self._wormhole, self._l4)
+            gm.start()
+        ...
+        yield self._l4.when_first_connected()
+        peer_addr = _SubchannelAddress()
+        control_ep = ControlEndpoint(peer_addr, ??) # needs gluing
+        connect_ep = SubchannelConnectorEndpoint(self._l4)
+        listen_ep = SubchannelListenerEndpoint(self._l4)
+        endpoints = (control_ep, connect_ep, listen_ep)
+        returnValue(endpoints)
+
+    def got_dilation_message(self, message):
+        # this receives new in-order DILATE-n payloads, decrypted and
+        # de-JSONed.
+        assert isinstance(message, dict)
+        type = message["type"]
+        if type == "please-dilate":
+            self.handle_please_dilate(message)
+        elif type == "start-dilation":
+            self.handle_start_dilation(message)
+        elif type == "ok-dilation":
+            self.handle_ok_dilation(message)
+        elif type == "connection-hints":
+            self.handle_connection_hints(message)
+        else:
+            log.err("received unknown dilation message type: {}".format(message))
+            return
+
+    def handle_please_dilate(self, message):
+        pass
+    def handle_start_dilation(self, message):
+        pass
+    def handle_ok_dilation(self, message):
+        pass
+    def handle_connection_hints(self, message):
+        pass
+
+    # from 
