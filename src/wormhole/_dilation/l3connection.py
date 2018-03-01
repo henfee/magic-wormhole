@@ -122,3 +122,23 @@ class L3Connection(object):
         seqnum = self.seqnum()
         self.send(seqnum, make_close(seqnum, self._outbound_box, subchannel_id))
         # XXX remove from self._subchannels ?
+
+    # NEW STUFF HERE
+
+    # from l2
+    def bad_frame(self, l2):
+        pass
+
+    def good_frame(self, l2, payload):
+        pass
+
+    def pauseProducing(self):
+        self._l4.pauseProducing()
+
+    def resumeProducing(self):
+        self._l4.resumeProducing()
+
+    # from L4
+
+    def encrypt_and_send(self, payload):
+        self._l2.encrypt_and_send(payload)
