@@ -32,10 +32,12 @@ establishment of a new one).
 We describe the protocol as a series of layers. Messages sent on one layer
 may be encoded or transformed before being delivered on some other layer.
 
-L1 is the mailbox channel. Both clients remain connected to the mailbox
-server, and send DILATE(gen=N) and PLEASE-DILATE() messages through the
-mailbox. They also send HINTS(gen=N) messages through the mailbox to find
-each other.
+L1 is the mailbox channel (queued store-and-forward messages that always go
+to the mailbox server, and then are forwarded to other clients subscribed to
+the same mailbox). Both clients remain connected to the mailbox server until
+the Wormhole is closed. They send DILATE-n messages to each other to manage
+the dilation process, including records like `please-dilate`,
+`start-dilation`, `ok-dilation`, and `connection-hints`
 
 L2 is the set of competing connection attempts for a given generation of
 connection. Each time the Leader decides to establish a new connection, a new
@@ -78,6 +80,126 @@ local object too.
 All L5 subchannels will be paused (``pauseProducing()``) when the L3
 connection is paused or lost. They are resumed when the L3 connection is
 resumed or reestablished.
+
+## Initiating Dilation
+
+Dilation is triggered by calling the `w.dilate()` API. This returns a
+Deferred that will fire once the first L3 connection is established. It fires
+with a 3-tuple of endpoints that can be used to establish subchannels.
+
+For dilation to succeed, both sides must call `w.dilate()`, since the
+resulting endpoints are the only way to access the subchannels. If the other
+side never calls `w.dilate()`, the Deferred will never fire.
+
+The L1 (mailbox) path is used to deliver dilation requests and connection
+hints. The current mailbox protocol uses named "phases" to distinguish
+messages (rather than behaving like a regular ordered channel of arbitrary
+frames or bytes), and all-number phase names are reserved for application
+data (sent via `w.send_message()`). Therefore the dilation control messages
+use phases named `DILATE-0`, `DILATE-1`, etc. Each side maintains its own
+counter, so one side might be up to e.g. `DILATE-5` while the other has only
+gotten as far as `DILATE-2`. This effectively creates a unidirectional stream
+of `DILATE-n` messages, each containing one or more dilation record, of
+various types described below. Note that all phases beyond the initial
+VERSION and PAKE phases are encrypted by the shared session key.
+
+A future mailbox protocol might provide a simple ordered stream of messages,
+with application records and dilation records mixed together.
+
+Each `DILATE-n` message is a JSON-encoded dictionary with a `type` field that
+has a string value. The dictionary will have other keys that depend upon the
+type.
+
+`w.dilate()` triggers a `please-dilate` record with a set of versions that
+can be accepted. Both Leader and Follower emit this record, although the
+Leader is responsible for version decisions. Versions use strings, rather
+than integers, to support experimental protocols, however there is still a
+total ordering of preferability.
+
+```
+{ "type": "please-dilate",
+  "accepted-versions": ["1"]
+}
+```
+
+The Leader then sends a `start-dilation` message with a `version` field (the
+"best" mutually-supported value) and the new "L2 generation" number in the
+`generation` field. Generation numbers are integers, monotonically increasing
+by 1 each time.
+
+```
+{ "type": start-dilation,
+  "version": "1",
+  "generation": 1,
+}
+```
+
+The Follower responds with a `ok-dilation` message with matching `version`
+and `generation` fields.
+
+The Leader decides when a new dilation connection is necessary, both for the
+initial connection and any subsequent reconnects. Therefore the Leader has
+the exclusive right to send the `start-dilation` record. It won't send this
+until after it has sent its own `please-dilate`, and after it has received
+the Follower's `please-dilate`. As a result, local preparations may begin as
+soon as `w.dilate()` is called, but L2 connections do not begin until the
+Leader declares the start of a new L2 generation with the `start-dilation`
+message.
+
+Generations are non-overlapping. The Leader will drop all connections from
+generation 1 before sending the `start-dilation` for generation 2, and will
+not initiate any gen-2 connections until it receives the matching
+`ok-dilation` from the Follower. The Follower must drop all gen-1 connections
+before it sends the `ok-dilation` response (even if it thinks they are still
+functioning: if the Leader thought the gen-1 connection still worked, it
+wouldn't have started gen-2). Listening sockets can be retained, but any
+previous connection made through them must be dropped. This should avoid a
+race.
+
+(TODO: what about a follower->leader connection that was started before
+start-dilation is received, and gets established on the Leader side after
+start-dilation is sent? the follower will drop it after it receives
+start-dilation, but meanwhile the leader may accept it as gen2)
+
+(probably need to include the generation number in the handshake, or in the
+derived key)
+
+(TODO: reduce the number of round-trip stalls here, I've added too many)
+
+"Connection hints" are type/address/port records that tell the other side of
+likely targets for L2 connections. Both sides will try to determine their
+external IP addresses, listen on a TCP port, and advertise `(tcp,
+external-IP, port)` as a connection hint. The Transit Relay is also used as a
+(lower-priority) hint. These are sent in `connection-hint` records, which can
+be sent by the Leader any time after the `start-dilation` record, and by the
+Follower after the `ok-dilation` record. Each side will initiate connections
+upon receipt of the hints.
+
+```
+{ "type": "connection-hints",
+  "hints": [ ... ]
+}
+```
+
+### Connection Hint Format
+
+Each member of the `hints` field describes a potential L2 connection target
+endpoint, with an associated priority and a set of hints.
+
+The priority is a number (positive or negative float), where larger numbers
+indicate that the client supplying that hint would prefer to use this
+connection over others of lower number. This indicates a sense of cost or
+performance. For example, the Transit Relay is lower priority than a direct
+TCP connection, because it incurs a bandwidth cost (on the relay operator),
+as well as adding latency.
+
+Each endpoint has a set of hints, because the same target might be reachable
+by multiple hints. Once one hint succeeds, there is no point in using the
+other hints.
+
+TODO: think this through some more. What's the example of a single endpoint
+reachable by multiple hints? Should each hint have its own priority, or just
+each endpoint?
 
 ## L2 protocol
 
