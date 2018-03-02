@@ -353,10 +353,15 @@ class Dilation(object):
     def handle_please_dilate(self, message):
         pass
     def handle_start_dilation(self, message):
-        pass
+        if not self._generation:
+            self._generation = Generation(self._wormhole, self._l4, 0)
+        else:
+            self._generation = self._generation.spawn_the_next_generation()
+
     def handle_ok_dilation(self, message):
-        pass
+        self._generation.ok(message)
+
     def handle_connection_hints(self, message):
-        pass
+        self._generation.handle_connection_hints(message["hints"])
 
     # from 

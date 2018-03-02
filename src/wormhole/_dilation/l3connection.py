@@ -1,7 +1,7 @@
 
 @attrs
 class L3Connection(object):
-    """I represent the durable per-Wormhole 'level-3' connection.
+    """I represent a generation of level-3 connection.
 
     Each dilated Wormhole has exactly one of these, created at the
     moment of dilation, and destroyed along with the Wormhole. At any
@@ -11,6 +11,7 @@ class L3Connection(object):
 
     _wormhole = attrib(validator=instance_of(IWormhole))
     _is_leader = attrib(validator=instance_of(bool))
+    _generation = attrib(validator=instance_of(Generation))
 
     m = MethodicalMachine()
     set_trace = getattr(m, "_setTrace", lambda self, f: None)
@@ -177,3 +178,58 @@ class L3Connection(object):
 
     def encrypt_and_send(self, payload):
         self._l2.encrypt_and_send(payload)
+
+@attrs
+class ConnectionSelection(object):
+    _generation = attrib(validator=instance_of(Generation))
+
+    
+
+@attrs
+class Generation(object):
+    _l1 = attrib(validator=instance_of(IWormhole))
+    _l4 = attrib(validator=instance_of(L4Connection))
+    _gen = attrib(validator=instance_of(int))
+
+    m = MethodicalMachine()
+    set_trace = getattr(m, "_setTrace", lambda self, f: None)
+
+    @m.state(initial=True)
+    def idle(self): pass # pragma: no cover
+    @m.state()
+    def waiting(self): pass # pragma: no cover
+    @m.state()
+    def active(self): pass # pragma: no cover
+
+    @m.input()
+    def start(self):
+        pass
+    @m.input()
+    def got_ok(self):
+        pass
+    @m.input()
+    def lost(self):
+        pass
+
+    @m.output()
+    def send_start(self):
+        if self._l3:
+            # make sure all previous connections (established and pending) are
+            # stopped
+            self._l3.shutdown()
+        gen = self._next_generation
+        self._next_generation += 1
+        self._l1.send_dilate("start-dilation", version="1", generation=gen)
+
+    @m.output()
+    def start_connecting(self):
+        pass
+
+    idle.upon(start, enter=waiting, outputs=[send_start])
+    waiting.upon(got_ok, enter=active, outputs=[start_connecting])
+    active.upon(lost, enter=waiting, outputs=[send_start])
+
+    def spawn_the_next_generation(self):
+        if self._l3:
+            self._l3.shutdown()
+        g = Generation(self._l1, self._l4, self._gen+1)
