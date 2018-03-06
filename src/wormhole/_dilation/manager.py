@@ -94,6 +94,10 @@ class Dilation(object):
                                     self._relay_url)
         self._connector.start()
 
+    @m.output()
+    def stop_connecting(self):
+        self._connector.stop()
+
     def send_hints(self, hints): # from Connector
         self.send_dilation_phase(type="hints", hints=hints)
 
@@ -101,21 +105,33 @@ class Dilation(object):
     def use_hints(self, hints):
         self._connector.use_hints(hints)
 
+    def resume(self):
+        self._flag = RESUMED
+        self._l4.send_queued_messages() # might get us paused
+        if self._flag is RESUMED:
+            # for fairness, keep a dequeue of subchannels. each time we
+            # resume one from the front, move it to the back. When we resume
+            # everything, cycle through the list until we get paused or get
+            # to the end without being paused
+            self._l4.resume_all_subchannels() # might get us paused
+
+    def l2_paused(self):
+        self._flag = PAUSED
+        self._l4.pause_all_subchannels()
+
+    def l2_resume(self):
+        self.resume()
+
     @m.output()
     def use_connection(self, l2):
         self._l2 = l2
         self._l4.set_l2(l2)
-        self._flag = RESUMED
-        self._l4.send_queued_messages()
-        if self._flag is RESUMED:
-            self._l4.resume_all_subchannels() # might get us paused
+        self.resume()
 
     @m.output()
-    def pause(self):
+    def stop_using_connection(self):
         self._l4.pause_all_subchannels()
         self._flag = PAUSED
-    @m.output()
-    def stop_using_connection(self):
         self._l4.remove_l2()
         del self._l2
     @m.output()
@@ -141,8 +157,7 @@ class Dilation(object):
     leader_connected.upon(rx_HINTS, enter=leader_connected,
                           outputs=[]) # too late, ignore them
     leader_connected.upon(l2_lost, enter=leader_connecting,
-                          outputs=[pause,
-                                   stop_using_connection,
+                          outputs=[stop_using_connection,
                                    send_dilate,
                                    start_connecting])
     # shouldn't happen: rx_DILATE, l2_connected
@@ -157,16 +172,17 @@ class Dilation(object):
                              outputs=[use_hints])
     follower_connecting.upon(l2_connected, enter=follower_connected,
                              outputs=[use_connection])
-    follower_connecting.upon(l2_lost, enter=follower_connecting, outputs=[?])
-    follower_connecting.upon(rx_DILATE, enter=follower_connecting, outputs=[?])
+    follower_connecting.upon(rx_DILATE, enter=follower_connecting,
+                             outputs=[stop_connecting, start_connecting])
+    # shouldn't happen: l2_lost
 
-    follower_connected.upon(l2_lost, enter=follower_connected,
-                            outputs=[pause, stop_using_connection])
-    follower_connected.upon(rx_DILATE, enter=follower_connecting,
-                            outputs=[pause, stop_using_connection,
-                                     start_connecting]) # ??
     follower_connected.upon(rx_HINTS, enter=follower_connected,
                             outputs=[]) # too late, ignore them
+    follower_connected.upon(l2_lost, enter=follower_wanting,
+                            outputs=[stop_using_connection])
+    follower_connected.upon(rx_DILATE, enter=follower_connecting,
+                            outputs=[stop_using_connection,
+                                     start_connecting])
     # shouldn't happen: l2_connected
 
     # from wormhole
