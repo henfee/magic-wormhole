@@ -117,9 +117,21 @@ def there_can_be_only_one(contenders):
     return _ThereCanBeOnlyOne(contenders).run()
 
 
-class Common:
+@attrs
+class Connector:
+    _generation = attrib(validator=instance_of(int))
+    _transit_key = attrib(validator=instance_of(type(b""))) # SecretBox.KEY_SIZE
+    _relay_url = attrib(validator=instance_of(str))
+    _manager = attrib(validator=instance_of(Manager))
+
     RELAY_DELAY = 2.0
-    TRANSIT_KEY_LENGTH = SecretBox.KEY_SIZE
+
+    def start(self):
+        pass
+    def use_hints(self, hints):
+        pass
+
+    # self._manager.send_hints(hints)
 
     def __init__(self, transit_relay, no_listen=False, tor=None,
                  reactor=reactor, timing=None):

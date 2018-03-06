@@ -14,22 +14,43 @@ class Dilation(object):
         self._l4 = L4(self._eventual_queue)
         self._got_versions_d = Deferred()
 
+    # current scheme:
+    # * only the leader sends DILATE, only follower sends PLEASE
+    # * follower sends PLEASE upon w.dilate
+    # * leader doesn't send DILATE until receiving PLEASE and local w.dilate
+    # * leader handles either order of (w.dilate, rx_PLEASE)
+    # * maybe signal warning if we stay in a "want" state for too long
+    # * after sending DILATE, leader sends HINTS without waiting for response
+    # * nobody sends HINTS until they're ready to receive
+    # * nobody sends HINTS unless they've called w.dilate()
+    # * nobody connects to inbound hints unless they've called w.dilate()
+    # * if leader calls w.dilate() but not follower, leader waits forever in
+    #   "want" (doesn't send anything)
+    # * if follower calls w.dilate() but not leader, follower waits forever
+    #   in "want", leader waits forever in "wanted"
 
     # We're "idle" until all three of:
     # 1: we receive the initial VERSION message and learn our peer's "side"
     #    value (then we compare sides, and the higher one is "leader", and
     #    the lower one is "follower")
-    # 2: the peer is capable of dilation
+    # 2: the peer is capable of dilation, qv version["can-dilate"] which is
+    #    a list of integers, require some overlap, "1" is current
     # 3: the local app calls w.dilate()
 
     @m.state(initial=True)
     def idle(self): pass # pragma: no cover
 
     @m.state()
+    def leader_wanting(self): pass # pragma: no cover
+    @m.state()
+    def leader_wanted(self): pass # pragma: no cover
+    @m.state()
     def leader_connecting(self): pass # pragma: no cover
     @m.state()
     def leader_connected(self): pass # pragma: no cover
 
+    @m.state()
+    def follower_wanting(self): pass # pragma: no cover
     @m.state()
     def follower_connecting(self): pass # pragma: no cover
     @m.state()
@@ -40,9 +61,11 @@ class Dilation(object):
     @m.input()
     def start_follower(self): pass # pragma: no cover
     @m.input()
-    def rx_DILATE(self): pass # pragma: no cover
+    def rx_PLEASE(self, message): pass # pragma: no cover
     @m.input()
-    def rx_HINTS(self): pass # pragma: no cover
+    def rx_DILATE(self, message): pass # pragma: no cover
+    @m.input()
+    def rx_HINTS(self, message): pass # pragma: no cover
 
     # Both leader and follower are given l2_connected. The leader sees this
     # when the first connection passes negotiation.
@@ -67,7 +90,9 @@ class Dilation(object):
 
     @m.output()
     def start_connecting(self, generation):
-        self._connector = Connector(generation)
+        self._connector = Connector(generation, self._transit_key,
+                                    self._relay_url)
+        self._connector.start()
 
     def send_hints(self, hints): # from Connector
         self.send_dilation_phase(type="hints", hints=hints)
@@ -76,31 +101,70 @@ class Dilation(object):
     def use_hints(self, hints):
         self._connector.use_hints(hints)
 
-    idle.upon(start_leader, enter=leader_connecting,
-              outputs=[send_dilate, start_connecting])
-    idle.upon(start_follower, enter=follower_connecting,
-              outputs=[start_connecting])
+    @m.output()
+    def use_connection(self, l2):
+        self._l2 = l2
+        self._l4.set_l2(l2)
+        self._flag = RESUMED
+        self._l4.send_queued_messages()
+        if self._flag is RESUMED:
+            self._l4.resume_all_subchannels() # might get us paused
+
+    @m.output()
+    def pause(self):
+        self._l4.pause_all_subchannels()
+        self._flag = PAUSED
+    @m.output()
+    def stop_using_connection(self):
+        self._l4.remove_l2()
+        del self._l2
+    @m.output()
+    def disconnect(self):
+        self._l2.loseConnection() # TODO: maybe already gone, for leader
+        
+
+    # PLEASE should only be sent by the follower
+    idle.upon(rx_PLEASE, enter=leader_wanted, outputs=[])
+    leader_wanted.upon(start_leader, enter=leader_connecting,
+                       outputs=[send_dilate, start_connecting])
+    idle.upon(start_leader, enter=leader_wanting, outputs=[])
+    leader_wanting.upon(rx_PLEASE, enter=leader_connecting,
+                        outputs=[send_dilate, start_connecting])
 
     leader_connecting.upon(rx_HINTS, enter=leader_connecting,
                            outputs=[use_hints])
-    leader_connecting.upon(l2_connected, enter=leader_connected, outputs=[?])
+    leader_connecting.upon(l2_connected, enter=leader_connected,
+                           outputs=[use_connection])
     # leader shouldn't be getting rx_DILATE, and l2_lost only happens while
     # connected
 
     leader_connected.upon(rx_HINTS, enter=leader_connected,
                           outputs=[]) # too late, ignore them
     leader_connected.upon(l2_lost, enter=leader_connecting,
-                          outputs=[leader_start_connection])
+                          outputs=[pause,
+                                   stop_using_connection,
+                                   send_dilate,
+                                   start_connecting])
     # shouldn't happen: rx_DILATE, l2_connected
+
+
+    idle.upon(start_follower, enter=follower_wanting, outputs=[send_please])
+    # leader shouldn't send DILATE before receiving PLEASE
+    follower_wanting.upon(rx_DILATE, enter=follower_connecting,
+                          outputs=[start_connecting])
 
     follower_connecting.upon(rx_HINTS, enter=follower_connecting,
                              outputs=[use_hints])
-    follower_connecting.upon(l2_connected, enter=follower_connected, outputs=[?])
+    follower_connecting.upon(l2_connected, enter=follower_connected,
+                             outputs=[use_connection])
     follower_connecting.upon(l2_lost, enter=follower_connecting, outputs=[?])
     follower_connecting.upon(rx_DILATE, enter=follower_connecting, outputs=[?])
 
-    follower_connected.upon(l2_lost, enter=follower_connected, outputs=[?])
-    follower_connected.upon(rx_DILATE, enter=follower_connecting, outputs=[?])
+    follower_connected.upon(l2_lost, enter=follower_connected,
+                            outputs=[pause, stop_using_connection])
+    follower_connected.upon(rx_DILATE, enter=follower_connecting,
+                            outputs=[pause, stop_using_connection,
+                                     start_connecting]) # ??
     follower_connected.upon(rx_HINTS, enter=follower_connected,
                             outputs=[]) # too late, ignore them
     # shouldn't happen: l2_connected
@@ -112,8 +176,8 @@ class Dilation(object):
         # called when w.dilate() is invoked
 
         # first, we wait until we hear the VERSION message, which tells us 1:
-        # the PAKE key works, so we can talk, 2: their side, so we know who
-        # will lead, and 3: that they can do dilation at all
+        # the PAKE key works, so we can talk securely, 2: their side, so we
+        # know who will lead, and 3: that they can do dilation at all
 
         (role, dilation_version) = yield self._got_versions_d
 
@@ -125,13 +189,6 @@ class Dilation(object):
         else:
             self.start_follower()
 
-        ...
-
-        #self._l3 = L3Connection(self._wormhole, self._my_role is LEADER)
-        if self._my_role is LEADER:
-            gm = GenerationManager(self._wormhole, self._l4)
-            gm.start()
-        ...
         yield self._l4.when_first_connected()
         peer_addr = _SubchannelAddress()
         control_ep = ControlEndpoint(peer_addr, ??) # needs gluing
@@ -156,24 +213,12 @@ class Dilation(object):
         # de-JSONed.
         message = bytes_to_dict(plaintext)
         type = message["type"]
-        if type == "dilate":
+        if type == "please":
+            self.rx_PLEASE(message)
+        elif type == "dilate":
             self.rx_DILATE(message)
         elif type == "connection-hints":
             self.rx_HINTS(message)
         else:
             log.err("received unknown dilation message type: {}".format(message))
             return
-
-    def handle_start_dilation(self, message):
-        if not self._generation:
-            self._generation = Generation(self._wormhole, self._l4, 0)
-        else:
-            self._generation = self._generation.spawn_the_next_generation()
-
-    def handle_ok_dilation(self, message):
-        self._generation.ok(message)
-
-    def handle_connection_hints(self, message):
-        self._generation.handle_connection_hints(message["hints"])
-
-    # from 
