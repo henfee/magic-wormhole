@@ -203,6 +203,7 @@ class _DeferredWormhole(object):
         self._verifier_observer.fire_if_not_fired(verifier)
     def got_wormhole_versions(self, our_side, their_side,
                               their_wormhole_versions):
+        # TODO: should we expose this API? or keep it internal for Dilation
         result = (our_side, their_side, their_wormhole_versions)
         self._wormhole_versions_and_sides_observer.fire_if_not_fired(result)
     def got_versions(self, versions):
