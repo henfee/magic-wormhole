@@ -149,11 +149,11 @@ class SubChannel(object):
 
     # IProducer
     def stopProducing(self):
-        pass
+        self._l4.subchannel_stopProducing(self)
     def pauseProducing(self):
-        pass
+        self._l4.subchannel_pauseProducing(self)
     def resumeProducing(self):
-        pass
+        self._l4.subchannel_resumeProducing(self)
 
     # IConsumer
     def registerProducer(self, producer, streaming):

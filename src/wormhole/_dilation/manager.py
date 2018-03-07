@@ -1,3 +1,5 @@
+from __future__ import print_function, unicode_literals
+from collections import namedtuple, deque
 from attr import attrs, attrib
 from attr.validators import instance_of
 from automat import MethodicalMachine
@@ -14,6 +16,21 @@ from .connector import Connector
 PAUSED, RESUMED = object(), object()
 LEADER, FOLLOWER = object(), object()
 
+(PING, PONG) = (b"\x00", b"\x01")
+(OPEN, DATA, CLOSE, ACK) = (b"\x02", b"\x03", b"\x04", b"\x05")
+
+Message = namedtuple("Message", ["id", "seqnum", "type", "data"])
+
+def encode(m):
+    if m.type in (PING, PONG):
+        return m.type + m.id
+    data = m.data if m.data is not None else b""
+    if m.type in (OPEN, DATA, CLOSE):
+        return m.type + m.id + be4(m.seqnum) + data
+    elif m.type == ACK:
+        return m.type + be4(m.seqnum)
+    raise ValueError("unknown m.type {}".format(m.type))
+
 class OldPeerCannotDilateError(Exception):
     pass
 
@@ -28,6 +45,12 @@ class Dilation(object):
     def __attrs_post_init__(self):
         self._l4 = L4(self._eventual_queue)
         self._got_versions_d = Deferred()
+
+        self._outbound_queue = deque()
+        self._next_outbound_seqnum = 0
+        self._highest_inbound_acked = -1
+        self._made_first_connection = False
+        self._first_connected = OneShotObserver(self._eventual_queue)
 
     # current scheme:
     # * only the leader sends DILATE, only follower sends PLEASE
@@ -134,31 +157,18 @@ class Dilation(object):
     @m.output()
     def use_connection(self, l2):
         self._l2 = l2
-        self._l4.set_l2(l2)
-        self._flag = RESUMED
-        self._l4.send_queued_messages()
-        if self._flag is RESUMED:
-            self._l4.resume_all_subchannels() # might get us paused
-
-    def pause(self):
-        pass # TODO
-
-    def resume(self):
-        self._flag = RESUMED
-        if self._flag is RESUMED:
-            # For fairness, keep a dequeue of subchannels. Each time the
-            # channel opens up, pop one from the front, move it to the back,
-            # then resume it. If that doesn't pause us, do the same for the
-            # next one, etc, until either we're paused or everything got
-            # resumed.
-            # TODO
-            self._l4.resume_all_subchannels() # might get us paused
+        self._queued_unsent = self._queued.copy()
+        # the connection can tell us to pause when we send too much data
+        l2.registerProducer(self, True) # IPushProducer: pause+resume
+        # that should call self.resumeProducing right away, which will send our
+        # queued messages and unpause our subchannels. TODO: confirm this
+        if not self._made_first_connection:
+            self._made_first_connection = True
+            self._first_connected.fire(None)
 
     @m.output()
     def stop_using_connection(self):
-        self._l4.pause_all_subchannels()
-        self._flag = PAUSED
-        self._l4.remove_l2()
+        self.pauseProducing()
         del self._l2
     @m.output()
     def disconnect(self):
@@ -218,8 +228,173 @@ class Dilation(object):
                             outputs=[]) # too late, ignore them
     # shouldn't happen: l2_connected
 
-    # from wormhole
 
+    # subchannel maintenance
+    def allocate_subchannel_id(self):
+        # am I the leader or the follower?
+        pass
+
+    def send_open(self, scid):
+        m = Message(type=OPEN, id=scid, seqnum=self._get_next_seqnum(),
+                    data=None)
+        self._queue_and_send(m)
+
+    def send_data(self, scid, data):
+        m = Message(type=DATA, id=scid, seqnum=self._get_next_seqnum(),
+                    data=data)
+        self._queue_and_send(m)
+    def send_close(self, scid):
+        m = Message(type=CLOSE, id=scid, seqnum=self._get_next_seqnum(),
+                    data=None)
+        self._queue_and_send(m)
+
+    def _queue_and_send(self, m):
+        self._outbound_queue.append(m)
+        if self._l3:
+            self._l3.encrypt_and_send(encode(m))
+
+    def subchannel_closed(self, scid, t):
+        assert self._subchannels[scid] is t
+        del self._subchannels[scid]
+
+    # from our L5 subchannels
+    def subchannel_pauseProducing(self, sc):
+        was_paused = bool(self._paused_subchannels)
+        self._paused_subchannels.add(sc)
+        if not was_paused:
+            self._l2.pauseProducing()
+
+    def subchannel_resumeProducing(self, sc):
+        self._paused_subchannels.discard(sc)
+        if not self._paused_subchannels:
+            self._l2.resumeProducing()
+
+    def subchannel_stopProducing(self, sc):
+        self._paused_subchannels.discard(sc)
+
+
+    # from our active L2 connection
+
+    def when_first_connected(self):
+        return self._first_connected.when_fired()
+
+    def _get_next_seqnum(self):
+        seqnum = self._next_outbound_seqnum
+        self._next_outbound_seqnum += 1
+        return seqnum
+
+    def got_message(self, frame):
+        msgtype = frame[0:1]
+        if msgtype == PING:
+            ping_id = frame[1:5]
+            self.handle_ping(ping_id)
+        elif msgtype == PONG:
+            ping_id = frame[1:5]
+            self.handle_pong(ping_id)
+        elif msgtype == OPEN:
+            scid = frame[1:5]
+            seqnum = frame[5:9]
+            self.handle_open(scid)
+            self.ack(seqnum)
+        elif msgtype == DATA:
+            scid = frame[1:5]
+            seqnum = frame[5:9]
+            data = frame[9:]
+            self.handle_data(scid, data)
+            self.ack(seqnum)
+        elif msgtype == CLOSE:
+            scid = frame[1:5]
+            seqnum = frame[5:9]
+            self.handle_close(scid)
+            self.ack(seqnum)
+        elif msgtype == ACK:
+            resp_seqnum = frame[1:5]
+            self.handle_ack(resp_seqnum)
+        else:
+            log.err("received unknown message type {}".format(frame))
+
+    def send_ping(self, ping_id):
+        if self._l3:
+            m = Message(type=PING, id=ping_id, seqnum=None, data=None)
+            self._l3.encrypt_and_send(encode(m))
+
+    def send_pong(self, ping_id):
+        if self._l3:
+            m = Message(type=PONG, id=ping_id, seqnum=None, data=None)
+            self._l3.encrypt_and_send(encode(m))
+
+    def ack(self, resp_seqnum):
+        # ACKs are not queued
+        if self._l3:
+            m = Message(type=ACK, id=NONE, seqnum=seqnum, data=None)
+            self._l3.encrypt_and_send(encode(m))
+        self._highest_inbound_acked = resp_seqnum
+
+    def handle_ping(self, ping_id):
+        self.send_pong(ping_id)
+
+    def handle_pong(self, ping_id):
+        # TODO: update is-alive timer
+        pass
+
+    def handle_open(self, scid):
+        if scid in self._open_subchannels:
+            log.err("received duplicate OPEN for {}".format(scid))
+            return
+        host_addr = _SubchannelAddress(scid)
+        peer_addr = _SubchannelAddress(scid)
+        t = SubChannel(scid, self, host_addr, peer_addr)
+        self._open_subchannels[scid] = t
+        self._listener_endpoint._got_open(t)
+
+    def handle_data(self, scid, data):
+        t = self._open_subchannels.get(scid)
+        if t is None:
+            log.err("received DATA for non-existent subchannel {}".format(scid))
+            return
+        t.remote_data(data)
+
+    def handle_close(self, scid):
+        t = self._open_subchannels.get(scid)
+        if t is None:
+            log.err("received CLOSE for non-existent subchannel {}".format(scid))
+            return
+        t.remote_close(data)
+
+    def handle_ack(self, resp_seqnum):
+        while (self._outbound_queue and
+               self._outbound_queue[0].seqnum <= resp_seqnum):
+            self._outbound_queue.popleft()
+        self._highest_inbound_acked = max(self._highest_inbound_acked,
+                                          resp_seqnum)
+
+    # IProducer
+    def pauseProducing(self):
+        self._paused = True
+        for t in self._subchannels.values():
+            t.pauseProducing()
+
+    def resumeProducing(self):
+        self._paused = False
+
+        # first, send any queued messages that we haven't yet sent for this
+        # connection, checking for a pause after each one
+        while self._queued_unsent:
+            m = self._queued_unsent.popleft()
+            self.encrypt_and_send(encode(m))
+            if self._paused:
+                return
+
+        # TODO: For fairness, keep a deque of subchannels. Each time the
+        # channel opens up, pop one from the front, move it to the back, then
+        # resume it. If that doesn't pause us, do the same for the next one,
+        # etc, until either we're paused or everything got resumed.
+
+        for t in self._subchannels.values():
+            t.resumeProducing() # TODO
+
+
+    # from wormhole
     @inlineCallbacks
     def dilate(self, eventual_queue):
         # called when w.dilate() is invoked
