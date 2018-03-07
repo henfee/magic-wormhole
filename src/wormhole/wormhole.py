@@ -13,6 +13,7 @@ from ._boss import Boss
 from ._key import derive_key
 from .errors import NoKeyError, WormholeClosed
 from .util import to_bytes
+from ._dilation.connector import Connector
 
 # We can provide different APIs to different apps:
 # * Deferreds
@@ -171,10 +172,7 @@ class _DeferredWormhole(object):
         return derive_key(self._key, to_bytes(purpose), length)
 
     def dilate(self):
-        from ._fake_dilate import start_dilation
-        d = start_dilation(self, self._reactor)
-        return d # fires with (endpoints)
-
+        return self._boss.dilate() # fires with (endpoints)
 
     def close(self):
         # fails with WormholeError unless we established a connection
@@ -247,7 +245,11 @@ def create(appid, relay_url, reactor, # use keyword args for everything else
         w = _DelegatedWormhole(delegate)
     else:
         w = _DeferredWormhole(reactor, eq)
-    wormhole_versions = {} # will be used to indicate Wormhole capabilities
+    # this indicates Wormhole capabilities
+    wormhole_versions = {
+        "can-dilate": [1],
+        "dilation-abilities": Connector.get_connection_abilities(),
+        }
     wormhole_versions["app_versions"] = versions # app-specific capabilities
     b = Boss(w, side, relay_url, appid, wormhole_versions,
              reactor, journal, tor, timing)

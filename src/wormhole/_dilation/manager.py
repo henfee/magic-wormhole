@@ -41,8 +41,7 @@ class OldPeerCannotDilateError(Exception):
 
 @attrs
 @implementer(IDilationManager)
-class Dilation(object):
-    _wormhole = attrib(validator=instance_of(IWormhole))
+class DilationManager(object):
     _eventual_queue = attrib()
 
     m = MethodicalMachine()
@@ -51,13 +50,16 @@ class Dilation(object):
     def __attrs_post_init__(self):
         self._got_versions_d = Deferred()
 
+        self._started = False
+        self._endpoints = OneShotObserver(self._eventual_queue)
+
         self._next_subchannel_id = 0 # increments by 2
         self._outbound_queue = deque()
         self._next_outbound_seqnum = 0
         self._highest_inbound_acked = -1
         self._made_first_connection = False
         self._first_connected = OneShotObserver(self._eventual_queue)
-        self._host_addr = _WormholeAddress(self._wormhole)
+        self._host_addr = _WormholeAddress()
 
     # current scheme:
     # * only the leader sends DILATE, only follower sends PLEASE
@@ -165,7 +167,8 @@ class Dilation(object):
     def _start_connecting(self):
         self._connector = Connector(self._current_generation,
                                     self._transit_key,
-                                    self._relay_url)
+                                    self._relay_url,
+                                    self)
         self._connector.start()
 
     @m.output()
@@ -177,8 +180,9 @@ class Dilation(object):
 
     @m.output()
     def use_hints(self, hints):
-        self._connector.use_hints(hints)
+        self._connector.got_hints(hints)
 
+    # from the Connector: use_connection
     @m.output()
     def use_connection(self, l2):
         self._l2 = l2
@@ -340,14 +344,14 @@ class Dilation(object):
             if self._role is LEADER:
                 if payload != b"":
                     log.err("weird, Follower's KCM wasn't empty")
-                self._connector.add_l2_candidate(l2)
+                self._connector.add_candidate(l2)
             if self._role is FOLLOWER:
                 # as follower, we expect to see one KCM frame from the selected
                 # L2, and silence from the rest. So use the L2 for the first
                 # good frame we get.
                 if payload != b"":
                     log.err("weird, Leader's KCM wasn't empty")
-                self._connector.accept_l2(l2)
+                self._connector.accept(l2)
         else:
             self._got_message(payload)
 
@@ -469,11 +473,18 @@ class Dilation(object):
             t.resumeProducing() # TODO
 
 
-    # from wormhole
-    @inlineCallbacks
-    def dilate(self, eventual_queue):
-        # called when w.dilate() is invoked
+    # from Boss
 
+    # this is the primary entry point.
+    def dilate(self):
+        # called when w.dilate() is invoked
+        if not self._started:
+            self._started = True
+            self._start().addBoth(self._endpoints.fire)
+        yield self._endpoints.when_fired()
+
+    @inlineCallbacks
+    def _start(self):
         # first, we wait until we hear the VERSION message, which tells us 1:
         # the PAKE key works, so we can talk securely, 2: their side, so we
         # know who will lead, and 3: that they can do dilation at all
@@ -497,7 +508,6 @@ class Dilation(object):
         endpoints = (control_ep, connect_ep, listen_ep)
         returnValue(endpoints)
 
-    # from Boss
     def got_wormhole_versions(self, our_side, their_side,
                               their_wormhole_versions):
         # this always happens before received_dilate

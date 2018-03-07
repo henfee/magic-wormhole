@@ -20,7 +20,7 @@ from ._input import Input
 from ._code import Code, validate_code
 from ._terminator import Terminator
 from ._wordlist import PGPWordList
-from ._dilation.manager import Dilation
+from ._dilation.manager import DilationManager
 from .errors import (ServerError, LonelyError, WrongPasswordError,
                      OnlyOneCodeError, _UnknownPhaseError, WelcomeError)
 from .util import bytes_to_dict
@@ -59,7 +59,7 @@ class Boss(object):
         self._I = Input(self._timing)
         self._C = Code(self._timing)
         self._T = Terminator()
-        self._D = Dilation()
+        self._D = DilationManager()
 
         self._N.wire(self._M, self._I, self._RC, self._T)
         self._M.wire(self._N, self._RC, self._O, self._T)
@@ -171,6 +171,9 @@ class Boss(object):
             raise OnlyOneCodeError()
         self._did_start_code = True
         self._C.set_code(code)
+
+    def dilate(self):
+        return self._D.dilate() # fires with endpoints
 
     @m.input()
     def send(self, plaintext): pass
