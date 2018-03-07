@@ -109,6 +109,8 @@ class Dilation(object):
 
     @m.output()
     def start_connecting_for_generation(self, generation):
+        if self._connector:
+            self._connector.stop()
         self._current_generation = generation
         self._start_connecting()
 
@@ -138,6 +140,19 @@ class Dilation(object):
         if self._flag is RESUMED:
             self._l4.resume_all_subchannels() # might get us paused
 
+    def pause(self):
+        pass # TODO
+
+    def resume(self):
+        self._flag = RESUMED
+        if self._flag is RESUMED:
+            # For fairness, keep a dequeue of subchannels. Each time the
+            # channel opens up, pop one from the front, move it to the back,
+            # then resume it. If that doesn't pause us, do the same for the
+            # next one, etc, until either we're paused or everything got
+            # resumed.
+            # TODO
+            self._l4.resume_all_subchannels() # might get us paused
 
     @m.output()
     def stop_using_connection(self):
@@ -182,14 +197,13 @@ class Dilation(object):
                              outputs=[use_hints])
     follower_connecting.upon(l2_connected, enter=follower_connected,
                              outputs=[use_connection])
+    # shouldn't happen: l2_lost
     #follower_connecting.upon(l2_lost, enter=follower_connecting, outputs=[?])
     follower_connecting.upon(rx_DILATE, enter=follower_connecting,
                              outputs=[start_connecting_for_generation])
     # receiving rx_DILATE while we're still working on the last one means the
     # leader thought we'd connected, then thought we'd been disconnected, all
     # before we heard about that connection
-
-    # shouldn't happen: l2_lost
 
     follower_connected.upon(l2_lost, enter=follower_wanting,
                             outputs=[stop_using_connection])
