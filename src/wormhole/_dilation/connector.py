@@ -1,3 +1,4 @@
+from .connection import DilatedConnectionProtocol
 
 # These namedtuples are "hint objects". The JSON-serializable dictionaries
 # are "hint dicts".
@@ -459,3 +460,24 @@ class Connector:
         # this one wins!
         self._winner = p
         return "go"
+
+
+
+# An object to manage the connection process for LETS-DILATE-n (one such object
+# per 'n').
+
+class ConnectorThingy:
+    n = attrib()
+
+    def event_rx_hints(hints): pass
+        # initiate outbound connection to each hint
+    def event_listener_ready(hint): pass
+    def event_connection_finished_negotiation(p):
+        # might cancel all orhers, or might wait for something better
+        pass
+    def event_nothing_better_timer_fired(): pass
+    def event_cancel(): pass
+
+    def output_notify_l3(): pass
+    
+    

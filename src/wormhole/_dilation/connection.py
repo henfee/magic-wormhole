@@ -14,7 +14,7 @@ PROLOGUE_FOLLOWER = b"Magic-Wormhole Dilation Handshake v1 Follower\n\n"
 NOISEPROTO = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
 
 @attrs
-class L2Protocol(Protocol):
+class DilatedConnectionProtocol(Protocol):
     """I manage an L2 connection.
 
     When a new L2 connection is needed (as determined by the Leader),
@@ -75,8 +75,7 @@ class L2Protocol(Protocol):
     @m.output()
     def process_decrypt(self, frame):
         try:
-            # TODO: first mesasge must use read_message, later must .decrypt
-            payload = self._noise.read_message(frame)
+            payload = self._noise.decrypt(frame)
         except NoiseInvalidMessage:
             # if this happens during tests, flunk the test
             log.err("bad inbound frame")
@@ -86,6 +85,7 @@ class L2Protocol(Protocol):
             self._manager.good_frame(self, payload)
 
     want_prologue.upon(got_prologue, enter=want_ephemeral, outputs=[])
+    # the Noise mode we use (NNpsk0) has exactly one handshake message
     want_ephemeral.upon(got_frame, enter=ready, outputs=[process_handshake])
     ready.upon(got_frame, enter=ready, outputs=[process_decrypt])
 

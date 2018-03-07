@@ -10,10 +10,9 @@ from .._interfaces import IWormhole, IDilationManager
 from ..util import dict_to_bytes, bytes_to_dict
 from ..observer import OneShotObserver
 from .encode import to_be4
-from .l4connection import L4
-from .l5_subchannel import (SubChannel, _SubchannelAddress, _WormholeAddress,
-                            ControlEndpoint, SubchannelConnectorEndpoint,
-                            SubchannelListenerEndpoint)
+from .subchannel import (SubChannel, _SubchannelAddress, _WormholeAddress,
+                         ControlEndpoint, SubchannelConnectorEndpoint,
+                         SubchannelListenerEndpoint)
 from .connector import Connector
 from .roles import LEADER, FOLLOWER
 
@@ -50,7 +49,6 @@ class Dilation(object):
     set_trace = getattr(m, "_setTrace", lambda self, f: None)
 
     def __attrs_post_init__(self):
-        self._l4 = L4(self._eventual_queue)
         self._got_versions_d = Deferred()
 
         self._next_subchannel_id = 0 # increments by 2
@@ -301,8 +299,8 @@ class Dilation(object):
 
     def _queue_and_send(self, m):
         self._outbound_queue.append(m)
-        if self._l3:
-            self._l3.encrypt_and_send(encode(m))
+        if self._l2:
+            self._l2.encrypt_and_send(encode(m))
 
     def subchannel_closed(self, scid, t):
         assert self._subchannels[scid] is t
@@ -342,14 +340,14 @@ class Dilation(object):
             if self._role is LEADER:
                 if payload != b"":
                     log.err("weird, Follower's KCM wasn't empty")
-                self._add_l2_candidate(l2)
+                self._connector.add_l2_candidate(l2)
             if self._role is FOLLOWER:
                 # as follower, we expect to see one KCM frame from the selected
                 # L2, and silence from the rest. So use the L2 for the first
                 # good frame we get.
                 if payload != b"":
                     log.err("weird, Leader's KCM wasn't empty")
-                self._accept_l2(l2)
+                self._connector.accept_l2(l2)
         else:
             self._got_message(payload)
 
@@ -392,20 +390,20 @@ class Dilation(object):
         return seqnum
 
     def send_ping(self, ping_id):
-        if self._l3:
+        if self._l2:
             m = Message(type=PING, id=ping_id, seqnum=None, data=None)
-            self._l3.encrypt_and_send(encode(m))
+            self._l2.encrypt_and_send(encode(m))
 
     def send_pong(self, ping_id):
-        if self._l3:
+        if self._l2:
             m = Message(type=PONG, id=ping_id, seqnum=None, data=None)
-            self._l3.encrypt_and_send(encode(m))
+            self._l2.encrypt_and_send(encode(m))
 
     def ack(self, resp_seqnum):
         # ACKs are not queued
-        if self._l3:
+        if self._l2:
             m = Message(type=ACK, id=None, seqnum=resp_seqnum, data=None)
-            self._l3.encrypt_and_send(encode(m))
+            self._l2.encrypt_and_send(encode(m))
         self._highest_inbound_acked = resp_seqnum
 
     def handle_ping(self, ping_id):
