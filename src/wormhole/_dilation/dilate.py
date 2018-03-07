@@ -67,9 +67,6 @@ class DilatedConnection(object):
     connected.upon(receive_ack, enter=connected, outputs=[process_ack])
     connected.upon(connection_lost, enter=not_connected, outputs=[])
 
-class OldPeerCannotDilateError(Exception):
-    pass
-
 @attrs
 class Dilation(object):
     _w = attrib(validator=instance_of(IWormhole))

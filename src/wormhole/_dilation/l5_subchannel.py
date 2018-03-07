@@ -1,3 +1,16 @@
+from attr import attrs, attrib
+from attr.validators import instance_of
+from zope.interface import implementer
+from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
+from twisted.internet.interfaces import (ITransport, IProducer, IConsumer,
+                                         IAddress, IListeningPort,
+                                         IStreamClientEndpoint,
+                                         IStreamServerEndpoint)
+from automat import MethodicalMachine
+from .. import _interfaces
+from .l4connection import L4
+
+
 
 class SingleUseEndpointError(Exception):
     pass
@@ -173,7 +186,7 @@ class ControlEndpoint(object):
         p.makeConnection(t) # set p.transport = t and call connectionMade()
         returnValue(p)
 
-@implementer(IStreamClientEndpoint):
+@implementer(IStreamClientEndpoint)
 @attrs
 class SubchannelConnectorEndpoint(object):
     _l4 = attrib(validator=instance_of(L4))
@@ -193,7 +206,7 @@ class SubchannelConnectorEndpoint(object):
         p.makeConnection(t) # set p.transport = t and call connectionMade()
         returnValue(p)
 
-@implementer(IStreamServerEndpoint):
+@implementer(IStreamServerEndpoint)
 @attrs
 class SubchannelListenerEndpoint(object):
     _l4 = attrib(validator=instance_of(L4))
