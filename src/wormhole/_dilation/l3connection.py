@@ -124,34 +124,6 @@ class L3Connection(object):
 
     # NEW STUFF HERE
 
-    # from l2
-    def bad_frame(self, l2):
-        if self._selected_l2 is None:
-            # well, we certainly aren't selecting this one
-            l2.disconnect()
-        else:
-            # make it go away. if that was our selected L2, this will start a
-            # new generation
-            l2.disconnect()
-
-    def good_frame(self, l2, payload):
-        if self._selected_l2 is None:
-            # we're waiting for selection to complete
-            # if we're the leader, this could be a KCM frame from a new L2
-            if self._role is LEADER:
-                if payload != b"":
-                    log.err("weird, Follower's KCM wasn't empty")
-                self._add_l2_candidate(l2)
-            if self._role is FOLLOWER:
-                # as follower, we expect to see one KCM frame from the selected
-                # L2, and silence from the rest. So use the L2 for the first
-                # good frame we get.
-                if payload != b"":
-                    log.err("weird, Leader's KCM wasn't empty")
-                self._accept_l2(l2)
-        else:
-            self._l3.got_message(payload)
-
     def lost_connection(self, l2):
         if l2 is self._selected_l2:
             self._l4.l3_disconnected()

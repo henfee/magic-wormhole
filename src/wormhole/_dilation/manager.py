@@ -3,18 +3,21 @@ from collections import namedtuple, deque
 from attr import attrs, attrib
 from attr.validators import instance_of
 from automat import MethodicalMachine
+from zope.interface import implementer
 from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
 from twisted.python import log
-from .._interfaces import IWormhole
+from .._interfaces import IWormhole, IDilationManager
 from ..util import dict_to_bytes, bytes_to_dict
+from ..observer import OneShotObserver
+from .encode import to_be4
 from .l4connection import L4
-from .l5_subchannel import (ControlEndpoint, SubchannelConnectorEndpoint,
-                            SubchannelListenerEndpoint, _SubchannelAddress)
+from .l5_subchannel import (SubChannel, _SubchannelAddress, _WormholeAddress,
+                            ControlEndpoint, SubchannelConnectorEndpoint,
+                            SubchannelListenerEndpoint)
 from .connector import Connector
-
+from .roles import LEADER, FOLLOWER
 
 PAUSED, RESUMED = object(), object()
-LEADER, FOLLOWER = object(), object()
 
 (PING, PONG) = (b"\x00", b"\x01")
 (OPEN, DATA, CLOSE, ACK) = (b"\x02", b"\x03", b"\x04", b"\x05")
@@ -23,18 +26,22 @@ Message = namedtuple("Message", ["id", "seqnum", "type", "data"])
 
 def encode(m):
     if m.type in (PING, PONG):
+        assert m.id is not None, m.id
         return m.type + m.id
     data = m.data if m.data is not None else b""
     if m.type in (OPEN, DATA, CLOSE):
-        return m.type + m.id + be4(m.seqnum) + data
+        assert m.id is not None, m.id
+        return m.type + m.id + to_be4(m.seqnum) + data
     elif m.type == ACK:
-        return m.type + be4(m.seqnum)
+        assert m.id is None, m.id
+        return m.type + to_be4(m.seqnum)
     raise ValueError("unknown m.type {}".format(m.type))
 
 class OldPeerCannotDilateError(Exception):
     pass
 
 @attrs
+@implementer(IDilationManager)
 class Dilation(object):
     _wormhole = attrib(validator=instance_of(IWormhole))
     _eventual_queue = attrib()
@@ -46,11 +53,13 @@ class Dilation(object):
         self._l4 = L4(self._eventual_queue)
         self._got_versions_d = Deferred()
 
+        self._next_subchannel_id = 0 # increments by 2
         self._outbound_queue = deque()
         self._next_outbound_seqnum = 0
         self._highest_inbound_acked = -1
         self._made_first_connection = False
         self._first_connected = OneShotObserver(self._eventual_queue)
+        self._host_addr = _WormholeAddress(self._wormhole)
 
     # current scheme:
     # * only the leader sends DILATE, only follower sends PLEASE
@@ -114,6 +123,24 @@ class Dilation(object):
     def l2_lost(self): pass # pragma: no cover
     # follower doesn't react to l2_lost, but waits for a new LETS_DILATE
 
+    @m.input()
+    def allocate_subchannel_id(self): pass # pragma: no cover
+
+    @m.output()
+    def allocate_leader_subchannel_id(self):
+        # scid 0 is reserved for the control channel. the leader uses odd
+        # numbers starting with 1
+        scid_num = self._next_outbound_seqnum + 1
+        self._next_outbound_seqnum += 2
+        return to_be4(scid_num)
+
+    @m.output()
+    def allocate_follower_subchannel_id(self):
+        # the follower uses even numbers starting with 2
+        scid_num = self._next_outbound_seqnum + 2
+        self._next_outbound_seqnum += 2
+        return to_be4(scid_num)
+
     def send_dilation_phase(self, **fields):
         dilation_phase = self._next_dilation_phase
         self._next_dilation_phase += 1
@@ -168,11 +195,12 @@ class Dilation(object):
 
     @m.output()
     def stop_using_connection(self):
+        # the connection is already lost by this point
         self.pauseProducing()
         del self._l2
     @m.output()
     def disconnect(self):
-        self._l2.loseConnection() # TODO: maybe already gone, for leader
+        self._l2.disconnect() # TODO: maybe already gone, for leader
 
     # PLEASE should only be sent by the follower
     idle.upon(rx_PLEASE, enter=leader_wanted, outputs=[])
@@ -228,6 +256,29 @@ class Dilation(object):
                             outputs=[]) # too late, ignore them
     # shouldn't happen: l2_connected
 
+    leader_wanting.upon(allocate_subchannel_id, enter=leader_wanting,
+                        outputs=[allocate_leader_subchannel_id],
+                        collector=lambda l: l[0])
+    leader_wanted.upon(allocate_subchannel_id, enter=leader_wanted,
+                       outputs=[allocate_leader_subchannel_id],
+                       collector=lambda l: l[0])
+    leader_connecting.upon(allocate_subchannel_id, enter=leader_connecting,
+                           outputs=[allocate_leader_subchannel_id],
+                           collector=lambda l: l[0])
+    leader_connected.upon(allocate_subchannel_id, enter=leader_connected,
+                          outputs=[allocate_leader_subchannel_id],
+                          collector=lambda l: l[0])
+
+    follower_wanting.upon(allocate_subchannel_id, enter=follower_wanting,
+                          outputs=[allocate_follower_subchannel_id],
+                          collector=lambda l: l[0])
+    follower_connecting.upon(allocate_subchannel_id, enter=follower_connecting,
+                            outputs=[allocate_follower_subchannel_id],
+                            collector=lambda l: l[0])
+    follower_connected.upon(allocate_subchannel_id, enter=follower_connected,
+                            outputs=[allocate_follower_subchannel_id],
+                            collector=lambda l: l[0])
+
 
     # subchannel maintenance
     def allocate_subchannel_id(self):
@@ -275,15 +326,34 @@ class Dilation(object):
 
     # from our active L2 connection
 
-    def when_first_connected(self):
-        return self._first_connected.when_fired()
+    def bad_frame(self, l2):
+        if self._selected_l2 is None:
+            # well, we certainly aren't selecting this one
+            l2.disconnect()
+        else:
+            # make it go away. if that was our selected L2, this will start a
+            # new generation
+            l2.disconnect()
 
-    def _get_next_seqnum(self):
-        seqnum = self._next_outbound_seqnum
-        self._next_outbound_seqnum += 1
-        return seqnum
+    def good_frame(self, l2, payload):
+        if self._selected_l2 is None:
+            # we're waiting for selection to complete
+            # if we're the leader, this could be a KCM frame from a new L2
+            if self._role is LEADER:
+                if payload != b"":
+                    log.err("weird, Follower's KCM wasn't empty")
+                self._add_l2_candidate(l2)
+            if self._role is FOLLOWER:
+                # as follower, we expect to see one KCM frame from the selected
+                # L2, and silence from the rest. So use the L2 for the first
+                # good frame we get.
+                if payload != b"":
+                    log.err("weird, Leader's KCM wasn't empty")
+                self._accept_l2(l2)
+        else:
+            self._got_message(payload)
 
-    def got_message(self, frame):
+    def _got_message(self, frame):
         msgtype = frame[0:1]
         if msgtype == PING:
             ping_id = frame[1:5]
@@ -313,6 +383,14 @@ class Dilation(object):
         else:
             log.err("received unknown message type {}".format(frame))
 
+    def when_first_connected(self):
+        return self._first_connected.when_fired()
+
+    def _get_next_seqnum(self):
+        seqnum = self._next_outbound_seqnum
+        self._next_outbound_seqnum += 1
+        return seqnum
+
     def send_ping(self, ping_id):
         if self._l3:
             m = Message(type=PING, id=ping_id, seqnum=None, data=None)
@@ -326,7 +404,7 @@ class Dilation(object):
     def ack(self, resp_seqnum):
         # ACKs are not queued
         if self._l3:
-            m = Message(type=ACK, id=NONE, seqnum=seqnum, data=None)
+            m = Message(type=ACK, id=None, seqnum=resp_seqnum, data=None)
             self._l3.encrypt_and_send(encode(m))
         self._highest_inbound_acked = resp_seqnum
 
@@ -341,11 +419,10 @@ class Dilation(object):
         if scid in self._open_subchannels:
             log.err("received duplicate OPEN for {}".format(scid))
             return
-        host_addr = _SubchannelAddress(scid)
         peer_addr = _SubchannelAddress(scid)
-        t = SubChannel(scid, self, host_addr, peer_addr)
+        t = SubChannel(scid, self, self._host_addr, peer_addr)
         self._open_subchannels[scid] = t
-        self._listener_endpoint._got_open(t)
+        self._listener_endpoint._got_open(t, peer_addr)
 
     def handle_data(self, scid, data):
         t = self._open_subchannels.get(scid)
@@ -359,7 +436,7 @@ class Dilation(object):
         if t is None:
             log.err("received CLOSE for non-existent subchannel {}".format(scid))
             return
-        t.remote_close(data)
+        t.remote_close()
 
     def handle_ack(self, resp_seqnum):
         while (self._outbound_queue and
@@ -415,9 +492,10 @@ class Dilation(object):
 
         yield self._l4.when_first_connected()
         peer_addr = _SubchannelAddress()
-        control_ep = ControlEndpoint(peer_addr) # needs gluing
-        connect_ep = SubchannelConnectorEndpoint(self._l4)
-        listen_ep = SubchannelListenerEndpoint(self._l4)
+        control_ep = ControlEndpoint(peer_addr)
+        # TODO glue: call control_ep._subchannel_zero_opened(sc)
+        connect_ep = SubchannelConnectorEndpoint(self)
+        listen_ep = SubchannelListenerEndpoint(self, self._host_addr)
         endpoints = (control_ep, connect_ep, listen_ep)
         returnValue(endpoints)
 

@@ -1,16 +1,25 @@
 from attr import attrs, attrib
-from attr.validators import instance_of
+from attr.validators import instance_of, provides
 from zope.interface import implementer
 from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
 from twisted.internet.interfaces import (ITransport, IProducer, IConsumer,
                                          IAddress, IListeningPort,
                                          IStreamClientEndpoint,
                                          IStreamServerEndpoint)
+from twisted.internet.error import ConnectionDone
 from automat import MethodicalMachine
-from .. import _interfaces
-from .l4connection import L4
+from .._interfaces import ISubChannel, IDilationManager, IWormhole
 
+@attrs
+class Once(object):
+    _errtype = attrib()
+    def __attrs_post_init__(self):
+        self._called = False
 
+    def __call__(self):
+        if self._called:
+            raise self._errtype()
+        self._called = True
 
 class SingleUseEndpointError(Exception):
     pass
@@ -33,6 +42,11 @@ class AlreadyClosedError(Exception):
     pass
 
 @implementer(IAddress)
+@attrs
+class _WormholeAddress(object):
+    _wormhole = attrib(validator=provides(IWormhole))
+
+@implementer(IAddress)
 class _SubchannelAddress(object):
     pass
 
@@ -41,11 +55,11 @@ class _SubchannelAddress(object):
 @implementer(ITransport)
 @implementer(IProducer)
 @implementer(IConsumer)
-@implementer(_interfaces.ISubChannel)
+@implementer(ISubChannel)
 class SubChannel(object):
     _id = attrib(validator=int)
-    _l4 = attrib(validator=instance_of(L4Connection))
-    _host_addr = attrib(validator=instance_of(_SubchannelAddress))
+    _manager = attrib(validator=provides(IDilationManager))
+    _host_addr = attrib(validator=instance_of(_WormholeAddress))
     _peer_addr = attrib(validator=instance_of(_SubchannelAddress))
 
     m = MethodicalMachine()
@@ -81,11 +95,11 @@ class SubChannel(object):
 
     @m.output()
     def send_data(self, data):
-        self._l4.send_data(self._id, data)
+        self._manager.send_data(self._id, data)
 
     @m.output()
     def send_close(self):
-        self._l4.send_close(self._id)
+        self._manager.send_close(self._id)
 
     @m.output()
     def signal_dataReceived(self, data):
@@ -97,10 +111,10 @@ class SubChannel(object):
     @m.output()
     def signal_connectionLost(self):
         if self._protocol:
-            self._protocol.connectionLost(what)
+            self._protocol.connectionLost(ConnectionDone())
         else:
-            self._pending_connectionLost = (True, what)
-        self._l4.subchannel_closed(self._id, self)
+            self._pending_connectionLost = (True, ConnectionDone())
+        self._manager.subchannel_closed(self._id, self)
         # we're deleted momentarily
 
     @m.output()
@@ -127,7 +141,7 @@ class SubChannel(object):
         assert not self._protocol
         self._protocol = protocol
         if self._pending_dataReceived:
-            for d in self._pending_dataReceived:
+            for data in self._pending_dataReceived:
                 self._protocol.dataReceived(data)
             self._pending_dataReceived =  []
         cl, what = self._pending_connectionLost[0]
@@ -143,17 +157,19 @@ class SubChannel(object):
     def loseConnection(self):
         self.local_close()
     def getHost(self):
+        # we define "host addr" as the overall wormhole
         return self._host_addr
     def getPeer(self):
+        # and "peer addr" as the subchannel within that wormhole
         return self._peer_addr
 
     # IProducer
     def stopProducing(self):
-        self._l4.subchannel_stopProducing(self)
+        self._manager.subchannel_stopProducing(self)
     def pauseProducing(self):
-        self._l4.subchannel_pauseProducing(self)
+        self._manager.subchannel_pauseProducing(self)
     def resumeProducing(self):
-        self._l4.subchannel_resumeProducing(self)
+        self._manager.subchannel_resumeProducing(self)
 
     # IConsumer
     def registerProducer(self, producer, streaming):
@@ -170,16 +186,17 @@ class ControlEndpoint(object):
     def __init__(self, peer_addr):
         self._subchannel_zero = Deferred()
         self._peer_addr = peer_addr
+        self._once = Once(SingleUseEndpointError)
 
-    def subchannel_zero_opened(self, subchannel):
-        self._cp.callback(control_protocol)
+    # from manager
+    def _subchannel_zero_opened(self, subchannel):
+        assert ISubChannel.providedBy(subchannel), subchannel
+        self._subchannel_zero.callback(subchannel)
 
     @inlineCallbacks
     def connect(self, protocolFactory):
         # return Deferred that fires with IProtocol or Failure(ConnectError)
-        if self._used:
-            raise SingleUseEndpointError
-        self._used = True
+        self._once()
         t = yield self._subchannel_zero
         p = protocolFactory.buildProtocol(self._peer_addr)
         t._set_protocol(p)
@@ -189,18 +206,18 @@ class ControlEndpoint(object):
 @implementer(IStreamClientEndpoint)
 @attrs
 class SubchannelConnectorEndpoint(object):
-    _l4 = attrib(validator=instance_of(L4))
+    _manager = attrib(validator=provides(IDilationManager))
+    _host_addr = attrib(validator=instance_of(_WormholeAddress))
 
     @inlineCallbacks
     def connect(self, protocolFactory):
         # return Deferred that fires with IProtocol or Failure(ConnectError)
-        scid = self._l4.allocate_subchannel_id()
-        self._l4.send_open(scid)
-        host_addr = _SubchannelAddress(scid)
+        scid = self._manager.allocate_subchannel_id()
+        self._manager.send_open(scid)
         peer_addr = _SubchannelAddress(scid)
         # ? f.doStart()
         # ? f.startedConnecting(CONNECTOR) # ??
-        t = SubChannel(scid, self._l4, host_addr, peer_addr)
+        t = SubChannel(scid, self._manager, self._host_addr, peer_addr)
         p = protocolFactory.buildProtocol(peer_addr)
         t._set_protocol(p)
         p.makeConnection(t) # set p.transport = t and call connectionMade()
@@ -209,20 +226,21 @@ class SubchannelConnectorEndpoint(object):
 @implementer(IStreamServerEndpoint)
 @attrs
 class SubchannelListenerEndpoint(object):
-    _l4 = attrib(validator=instance_of(L4))
+    _manager = attrib(validator=provides(IDilationManager))
+    _host_addr = attrib(validator=provides(IAddress))
 
     def __attrs_post_init__(self):
         self._factory = None
         self._pending_opens = []
 
-    # our L4 points here
-    def _got_open(self, t):
+    # from manager
+    def _got_open(self, t, peer_addr):
         if self._factory:
-            self._connect(t)
+            self._connect(t, peer_addr)
         else:
-            self._pending_opens.append(t)
+            self._pending_opens.append( (t, peer_addr) )
 
-    def _connect(self, t):
+    def _connect(self, t, peer_addr):
         p = self._factory.buildProtocol(peer_addr)
         t._set_protocol(p)
         p.makeConnection(t)
@@ -232,55 +250,21 @@ class SubchannelListenerEndpoint(object):
     @inlineCallbacks
     def listen(self, protocolFactory):
         self._factory = protocolFactory
-        for t in self._pending_opens:
-            self._connect(t)
+        for (t, peer_addr) in self._pending_opens:
+            self._connect(t, peer_addr)
         self._pending_opens = []
-
-
-@inlineCallbacks
-def start_dilation(w, reactor):
-    res = yield w._get_wormhole_versions_and_sides()
-    (our_side, their_side, their_wormhole_versions) = res
-    my_role = LEADER if our_side > their_side else FOLLOWER
-    # the control connection is defined to be an IStreamClientEndpoint on
-    # both sides. In the fake dilation, we do this by connecting from
-    # FOLLOWER to LEADER and then building a special endpoint around both
-    # sides.
-    peer_addr = _SubchannelAddress()
-    control_ep = ControlEndpoint(peer_addr)
-    connect_ep = SubchannelConnectorEndpoint()
-    listen_ep = SubchannelListenerEndpoint()
-    endpoints = (control_ep, connect_ep, listen_ep)
-    returnValue(endpoints)
-
-
-
-
-
-
-
+        lp = SubchannelListeningPort(self._host_addr)
+        returnValue(lp)
 
 @implementer(IListeningPort)
-class _SubchannelListener(object):
+@attrs
+class SubchannelListeningPort(object):
+    _host_addr = attrib(validator=provides(IAddress))
+
     def startListening(self):
         pass
     def stopListening(self):
+        # TODO
         pass
     def getHost(self):
-        return _SubchannelAddress()
-
-
-@implementer(IStreamServerEndpoint)
-@attrs
-class InboundSubchannelEndpoint(object):
-    _l3d = attrib(validator=instance_of(Deferred))
-    def __attrs_post_init__(self):
-        self._used = False
-    @inlineCallbacks
-    def listen(self, f):
-        if self._used:
-            raise SingleUseEndpointError
-        self._used = True
-        l3 = yield self._l3d
-        l3.registerInboundSubchannelFactory(f)
-        returnValue(_SubchannelListener())
+        return self._host_addr

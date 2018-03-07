@@ -1,17 +1,13 @@
+from attr import attrs, attrib
+from attr.validators import instance_of, provides
+from automat import MethodicalMachine
+from twisted.python import log
+from twisted.python.internet import Protocol
 from noise.connection import NoiseConnection
 from noise.exceptions import NoiseInvalidMessage
-
-assert len(struct.pack("<L", 0)) == 4
-assert len(struct.pack("<Q", 0)) == 8
-
-def be4(value):
-    if not 0 <= value < 2**32:
-        raise ValueError
-    return struct.pack(">L", value)
-def from_be4(b):
-    if len(b) != 4:
-        raise ValueError
-    return struct.unpack(">L")[0]
+from .._interfaces import IDilationManager
+from .encode import to_be4, from_be4
+from .roles import LEADER
 
 PROLOGUE_LEADER   = b"Magic-Wormhole Dilation Handshake v1 Leader\n\n"
 PROLOGUE_FOLLOWER = b"Magic-Wormhole Dilation Handshake v1 Follower\n\n"
@@ -32,9 +28,7 @@ class L2Protocol(Protocol):
     At any given time, there is at most one active L2 connection.
     """
 
-    _inbound_box = attrib(validator=instance_of(SecretBox))
-    _outbound_box = attrib(validator=instance_of(SecretBox))
-    _l3 = attrib(validator=instance_of(L3Connection))
+    _manager = attrib(validator=provides(IDilationManager))
     _dilation_key = attrib(validator=instance_of(bytes))
     _role = attrib()
     _got_prologue = False
@@ -86,10 +80,10 @@ class L2Protocol(Protocol):
         except NoiseInvalidMessage:
             # if this happens during tests, flunk the test
             log.err("bad inbound frame")
-            self._l3.bad_frame(self)
+            self._manager.bad_frame(self)
             return
         if payload is not None:
-            self._l3.good_frame(self, payload)
+            self._manager.good_frame(self, payload)
 
     want_prologue.upon(got_prologue, enter=want_ephemeral, outputs=[])
     want_ephemeral.upon(got_frame, enter=ready, outputs=[process_handshake])
@@ -133,24 +127,12 @@ class L2Protocol(Protocol):
             self.got_frame(frame)
 
     def connectionLost(self, why=None):
-        self._l3.lost_connection(self)
-
-    def pauseProducing(self):
-        # TODO: only do this if we're the active one. OTOH, if we aren't the
-        # active one, we shouldn't be sending so much data that we'll be told
-        # to pause.
-        self._l3.pauseProducing()
-
-    def resumeProducing(self):
-        # OT3H, if for some reason the potential connection does a
-        # resumeProducing at the very beginning, then we shouldn't be resuming
-        # the L3 unless we're the active one.
-        self._l3.resumeProducing()
+        self._manager.lost_connection(self)
 
     # from L3 above
     def encrypt_and_send(self, payload):
         frame = self._noise.send(payload)
-        self.transport.write(frame)
+        self.transport.write(to_be4(len(frame)) + frame)
 
     def disconnect(self):
         self.transport.loseConnection()
