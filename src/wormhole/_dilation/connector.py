@@ -1,4 +1,22 @@
+from __future__ import print_function, unicode_literals
+import sys, re
+from collections import defaultdict, namedtuple
+from binascii import hexlify
+import six
+from attr import attrs, attrib
+from attr.validators import instance_of, provides, optional
+from automat import MethodicalMachine
+from zope.interface import implementer
+from twisted.internet.task import deferLater
+from twisted.internet.endpoints import HostnameEndpoint, serverFromString
+from twisted.internet.protocol import ClientFactory, ServerFactory
+from twisted.python import log
+from hkdf import Hkdf
 from .connection import DilatedConnectionProtocol
+from .. import ipaddrs # TODO: move into _dilation/
+from .._interfaces import IDilationConnector, IDilationManager
+from ..timing import DebugTiming
+
 
 # These namedtuples are "hint objects". The JSON-serializable dictionaries
 # are "hint dicts".
@@ -17,16 +35,19 @@ TorTCPV1Hint = namedtuple("TorTCPV1Hint", ["hostname", "port", "priority"])
 # rest of the V1 protocol. Only one hint per relay is useful.
 RelayV1Hint = namedtuple("RelayV1Hint", ["hints"])
 
-def describe_hint_obj(hint):
+def describe_hint_obj(hint, relay, tor):
+    prefix = "tor->" if tor else "->"
+    if relay:
+        prefix = prefix + "relay:"
     if isinstance(hint, DirectTCPV1Hint):
-        return u"tcp:%s:%d" % (hint.hostname, hint.port)
+        return prefix + "tcp:%s:%d" % (hint.hostname, hint.port)
     elif isinstance(hint, TorTCPV1Hint):
-        return u"tor:%s:%d" % (hint.hostname, hint.port)
+        return prefix+"tor:%s:%d" % (hint.hostname, hint.port)
     else:
-        return str(hint)
+        return prefix+str(hint)
 
 def parse_hint_argv(hint, stderr=sys.stderr):
-    assert isinstance(hint, type(u""))
+    assert isinstance(hint, type(""))
     # return tuple or None for an unparseable hint
     priority = 0.0
     mo = re.search(r'^([a-zA-Z0-9]+):(.*)$', hint)
@@ -61,89 +82,72 @@ def parse_hint_argv(hint, stderr=sys.stderr):
     return DirectTCPV1Hint(hint_host, hint_port, priority)
 
 def parse_tcp_v1_hint(hint): # hint_struct -> hint_obj
-    hint_type = hint.get(u"type", u"")
-    if hint_type not in [u"direct-tcp-v1", u"tor-tcp-v1"]:
+    hint_type = hint.get("type", "")
+    if hint_type not in ["direct-tcp-v1", "tor-tcp-v1"]:
         log.msg("unknown hint type: %r" % (hint,))
         return None
-    if not(u"hostname" in hint
-           and isinstance(hint[u"hostname"], type(u""))):
+    if not("hostname" in hint
+           and isinstance(hint["hostname"], type(""))):
         log.msg("invalid hostname in hint: %r" % (hint,))
         return None
-    if not(u"port" in hint
-           and isinstance(hint[u"port"], six.integer_types)):
+    if not("port" in hint
+           and isinstance(hint["port"], six.integer_types)):
         log.msg("invalid port in hint: %r" % (hint,))
         return None
-    priority = hint.get(u"priority", 0.0)
-    if hint_type == u"direct-tcp-v1":
-        return DirectTCPV1Hint(hint[u"hostname"], hint[u"port"], priority)
+    priority = hint.get("priority", 0.0)
+    if hint_type == "direct-tcp-v1":
+        return DirectTCPV1Hint(hint["hostname"], hint["port"], priority)
     else:
-        return TorTCPV1Hint(hint[u"hostname"], hint[u"port"], priority)
+        return TorTCPV1Hint(hint["hostname"], hint["port"], priority)
 
-class _ThereCanBeOnlyOne:
-    """Accept a list of contender Deferreds, and return a summary Deferred.
-    When the first contender fires successfully, cancel the rest and fire the
-    summary with the winning contender's result. If all error, errback the
-    summary.
+def parse_hint(hint_struct):
+    hint_type = hint_struct.get("type", "")
+    if hint_type == "relay-v1":
+        # the struct can include multiple ways to reach the same relay
+        rhints = filter(lambda h: h, # drop None (unrecognized)
+                        [parse_tcp_v1_hint(rh) for rh in hint_struct["hints"]])
+        return RelayV1Hint(rhints)
+    return parse_tcp_v1_hint(hint_struct)
 
-    status_cb=?
-    """
-    def __init__(self, contenders):
-        self._remaining = set(contenders)
-        self._winner_d = defer.Deferred(self._cancel)
-        self._first_success = None
-        self._first_failure = None
-        self._have_winner = False
-        self._fired = False
+def encode_hint(h):
+    if isinstance(h, DirectTCPV1Hint):
+        return {"type": "direct-tcp-v1",
+                "priority": h.priority,
+                "hostname": h.hostname,
+                "port": h.port, # integer
+                }
+    elif isinstance(h, RelayV1Hint):
+        rhint = {"type": "relay-v1", "hints": []}
+        for rh in h.hints:
+            rhint["hints"].append({"type": "direct-tcp-v1",
+                                    "priority": rh.priority,
+                                    "hostname": rh.hostname,
+                                    "port": rh.port})
+        return rhint
+    elif isinstance(h, TorTCPV1Hint):
+        return {"type": "tor-tcp-v1",
+                "priority": h.priority,
+                "hostname": h.hostname,
+                "port": h.port, # integer
+                }
+    raise ValueError("unknown hint type", h)
 
-    def _cancel(self, _):
-        for d in list(self._remaining):
-            d.cancel()
-        # since that will errback everything in _remaining, we'll have hit
-        # _maybe_done() and fired self._winner_d by this point
+def HKDF(skm, outlen, salt=None, CTXinfo=b""):
+    return Hkdf(salt, skm).expand(CTXinfo, outlen)
 
-    def run(self):
-        for d in list(self._remaining):
-            d.addBoth(self._remove, d)
-            d.addCallbacks(self._succeeded, self._failed)
-            d.addCallback(self._maybe_done)
-        return self._winner_d
-
-    def _remove(self, res, d):
-        self._remaining.remove(d)
-        return res
-
-    def _succeeded(self, res):
-        self._have_winner = True
-        self._first_success = res
-        for d in list(self._remaining):
-            d.cancel()
-
-    def _failed(self, f):
-        if self._first_failure is None:
-            self._first_failure = f
-
-    def _maybe_done(self, _):
-        if self._remaining:
-            return
-        if self._fired:
-            return
-        self._fired = True
-        if self._have_winner:
-            self._winner_d.callback(self._first_success)
-        else:
-            self._winner_d.errback(self._first_failure)
-
-def there_can_be_only_one(contenders):
-    return _ThereCanBeOnlyOne(contenders).run()
-
+def build_sided_relay_handshake(key, side):
+    assert isinstance(side, type(u""))
+    assert len(side) == 8*2
+    token = HKDF(key, 32, CTXinfo=b"transit_relay_token")
+    return b"please relay "+hexlify(token)+b" for side "+side.encode("ascii")+b"\n"
 
 
 @attrs
+@implementer(IDilationConnector)
 class Connector:
-    _generation = attrib(validator=instance_of(int))
-    _transit_key = attrib(validator=instance_of(type(b""))) # SecretBox.KEY_SIZE
+    _dilation_key = attrib(validator=instance_of(type(b"")))
     _relay_url = attrib(validator=optional(instance_of(str)))
-    _manager = attrib(validator=instance_of(Manager))
+    _manager = attrib(validator=provides(IDilationManager))
     _reactor = attrib()
     _no_listen = attrib(validator=instance_of(bool))
     _tor = attrib()
@@ -151,6 +155,7 @@ class Connector:
     _side = attrib(validator=instance_of(str))
     # was self._side = bytes_to_hexstr(os.urandom(8)) # unicode
     _eventual_queue = attrib()
+    _role = attrib()
 
     m = MethodicalMachine()
     set_trace = getattr(m, "_setTrace", lambda self, f: None)
@@ -165,9 +170,9 @@ class Connector:
             self._transit_relays = [relay]
         else:
             self._transit_relays = []
-        self._their_direct_hints = [] # hintobjs
-        self._our_relay_hints = set(self._transit_relays)
-        self._listener = None
+        self._listeners = set() # IListeningPorts that can be stopped
+        self._pending_outbound_connections = set() # Deferreds to cancel
+        self._losing_connections = Emptiness() # Protocols that can be stopped
         self._winner = None
         self._timing = self._timing or DebugTiming()
         self._timing.add("transit")
@@ -175,8 +180,8 @@ class Connector:
     # this describes what our Connector can do, for the initial advertisement
     @classmethod
     def get_connection_abilities(klass):
-        return [{u"type": u"direct-tcp-v1"},
-                {u"type": u"relay-v1"},
+        return [{"type": "direct-tcp-v1"},
+                {"type": "relay-v1"},
                 ]
 
     @m.state(initial=True)
@@ -185,9 +190,9 @@ class Connector:
     def connected(self): pass # pragma: no cover
 
     @m.input()
-    def listener_ready(self, l): pass
+    def listener_ready(self, hint_objs): pass
     @m.input()
-    def got_hints(self, hints): pass
+    def got_hints(self, hint_structs): pass
     @m.input()
     def add_candidate(self, c): pass
     @m.input()
@@ -195,6 +200,10 @@ class Connector:
     @m.input()
     def stop(self): pass
 
+    @m.output()
+    def use_hints(self, hint_structs):
+        self._use_hints(filter(lambda h: h, # ignore None, unrecognizable
+                               [parse_hint(hs) for hs in hint_structs]))
     @m.output()
     def consider(self, c):
         # for now, just accept the first one
@@ -206,20 +215,22 @@ class Connector:
         self.stop_connections()
         self._manager.use_connection(c)
     @m.output()
-    def publish_hint(self, l):
-        hints = BUILD_HINTS(l)
-        self._manager.send_hints(hints)
+    def publish_hints(self, hint_objs):
+        self._manager.send_hints([encode_hint(h) for h in hint_objs])
     @m.output()
     def stop_listeners(self):
-        if self._listener:
-            self._listener.stopListening()
-            # TODO: synchronization for tests?
+        d = DeferredList([l.stopListening() for l in self._listeners])
+        self._listeners.clear()
+        return d # synchronization for tests
     @m.output()
-    def stop_connections(self):
-        pass
+    def stop_other_connections(self):
+        ds = [d.cancel() for d in self._pending_outbound_connections]
+        ds.append(self._losing_connections.when_next_empty())
+        [c.loseConnection() for c in self._losing_connections]
+        return DeferredList(ds)
 
 
-    connecting.upon(listener_ready, enter=connecting, outputs=[publish_hint])
+    connecting.upon(listener_ready, enter=connecting, outputs=[publish_hints])
     connecting.upon(got_hints, enter=connecting, outputs=[use_hints])
     connecting.upon(add_candidate, enter=connecting, outputs=[consider])
     connecting.upon(accept, enter=connected, outputs=[select])
@@ -236,173 +247,113 @@ class Connector:
     # from Manager: start, got_hints, stop
     # maybe add_candidate, accept
     def start(self):
-        direct_hints, ep = self._build_listener()
-        f = InboundConnectionFactory(self)
-        self._lp = None
-        d = ep.listen(f)
-        def _listening(lp):
-            # lp is an IListeningPort
-            self._lp = lp # for shutdown and tests
-            self.listener_ready(direct_hints)
-        d.addCallback(_listening)
-        d.addErrback(log.err)
+        self._start_listener()
+        if self._transit_relays:
+            self.publish_hints(self._transit_relays)
+            self._use_hints(self._transit_relays)
 
-    def use_hints(self, hints):
-        for h in hints: # hint structs
-            hint_type = h.get(u"type", u"")
-            if hint_type in [u"direct-tcp-v1", u"tor-tcp-v1"]:
-                dh = parse_tcp_v1_hint(h)
-                if dh:
-                    self._start_direct_hint(dh) # hint_obj
-            elif hint_type == u"relay-v1":
-                # TODO: each relay-v1 clause describes a different relay,
-                # with a set of equally-valid ways to connect to it. Treat
-                # them as separate relays, instead of merging them all
-                # together like this.
-                relay_hints = []
-                for rhs in h.get(u"hints", []):
-                    h = parse_tcp_v1_hint(rhs)
-                    if h:
-                        relay_hints.append(h)
-                if relay_hints:
-                    rh = RelayV1Hint(hints=tuple(sorted(relay_hints)))
-                    self._start_relay_hint(rh)
-            else:
-                log.msg("unknown hint type: %r" % (h,))
-
-    # vague internal things
-    def event_listener_ready(hint): pass
-    def event_connection_finished_negotiation(p):
-        # might cancel all orhers, or might wait for something better
-        pass
-    def event_nothing_better_timer_fired(): pass
-    def event_cancel(): pass
-        
-
-
-    def _build_listener(self):
+    def _start_listener(self):
         if self._no_listen or self._tor:
-            return ([], None)
-        portnum = allocate_tcp_port()
+            return
         addresses = ipaddrs.find_addresses()
         non_loopback_addresses = [a for a in addresses if a != "127.0.0.1"]
         if non_loopback_addresses:
             # some test hosts, including the appveyor VMs, *only* have
             # 127.0.0.1, and the tests will hang badly if we remove it.
             addresses = non_loopback_addresses
-        direct_hints = [DirectTCPV1Hint(six.u(addr), portnum, 0.0)
-                        for addr in addresses]
-        ep = endpoints.serverFromString(reactor, "tcp:%d" % portnum)
-        return direct_hints, ep
+        # TODO: listen on a fixed port, if possible, for NAT/p2p benefits, also
+        # to make firewall configs easier
+        # TODO: retain listening port between connection generations?
+        ep = serverFromString(self._reactor, "tcp:0")
+        f = InboundConnectionFactory(self, self._dilation_key)
+        d = ep.listen(f)
+        def _listening(lp):
+            # lp is an IListeningPort
+            self._listeners.add(lp) # for shutdown and tests
+            portnum = lp.getHost().port
+            direct_hints = [DirectTCPV1Hint(six.u(addr), portnum, 0.0)
+                            for addr in addresses]
+            self.listener_ready(direct_hints)
+        d.addCallback(_listening)
+        d.addErrback(log.err)
 
-    @inlineCallbacks
-    def get_connection_hints(self):
-        hints = []
-        direct_hints = yield self._get_direct_hints()
-        for dh in direct_hints:
-            hints.append({u"type": u"direct-tcp-v1",
-                          u"priority": dh.priority,
-                          u"hostname": dh.hostname,
-                          u"port": dh.port, # integer
-                          })
-        for relay in self._transit_relays:
-            rhint = {u"type": u"relay-v1", u"hints": []}
-            for rh in relay.hints:
-                rhint[u"hints"].append({u"type": u"direct-tcp-v1",
-                                        u"priority": rh.priority,
-                                        u"hostname": rh.hostname,
-                                        u"port": rh.port})
-            hints.append(rhint)
-        returnValue(hints)
+    def _use_hints(self, hints):
+        # first, pull out all the relays, we'll connect to them later
+        relays = defaultdict(list)
+        direct = defaultdict(list)
+        for h in hints:
+            if isinstance(h, RelayV1Hint):
+                relays[h.priority].append(h)
+            else:
+                direct[h.priority].append(h)
+        delay = 0.0
+        priorities = sorted(set(direct.keys()), reverse=True)
+        for p in priorities:
+            for h in direct[p]:
+                if isinstance(h, TorTCPV1Hint) and not self._tor:
+                    continue
+                ep = self._endpoint_from_hint_obj(h)
+                desc = describe_hint_obj(h, False, self._tor)
+                d = deferLater(self._reactor, delay,
+                               self._connect, ep, desc, is_relay=False)
+                self._pending_outbound_connections.add(d)
+                # Make all direct connections immediately. Later, we'll change
+                # the add_candidate() function to look at the priority when
+                # deciding whether to accept a successful connection or not,
+                # and it can wait for more options if it sees a higher-priority
+                # one still running. But if we bail on that, we might consider
+                # putting an inter-direct-hint delay here to influence the
+                # process.
+                #delay += 1.0
+        if delay > 0.0:
+            # Start trying the relays a few seconds after we start to try the
+            # direct hints. The idea is to prefer direct connections, but not
+            # be afraid of using a relay when we have direct hints that don't
+            # resolve quickly. Many direct hints will be to unused
+            # local-network IP addresses, which won't answer, and would take
+            # the full TCP timeout (30s or more) to fail. If there were no
+            # direct hints, don't delay at all.
+            delay += self.RELAY_DELAY
 
-    def _start_direct_hint(self, dh):
-        pass
-    def _start_relay_hint(self, rh):
-        pass
+        # prefer direct connections by stalling relay connections by a few
+        # seconds, unless we're using --no-listen in which case we're probably
+        # going to have to use the relay
+        delay = self.RELAY_DELAY if self._no_listen else 0.0
 
-    def _connect(self):
         # It might be nice to wire this so that a failure in the direct hints
         # causes the relay hints to be used right away (fast failover). But
         # none of our current use cases would take advantage of that: if we
         # have any viable direct hints, then they're either going to succeed
         # quickly or hang for a long time.
-        contenders = []
-        if self._listener_d:
-            contenders.append(self._listener_d)
-        relay_delay = 0
+        for p in priorities:
+            for r in relays[p]:
+                for h in r.hints:
+                    ep = self._endpoint_from_hint_obj(h)
+                    desc = describe_hint_obj(h, True, self._tor)
+                    d = deferLater(self._reactor, delay,
+                                   self._connect, ep, desc, is_relay=True)
+                    self._pending_outbound_connections.add(d)
+        # TODO:
+        #if not contenders:
+        #    raise TransitError("No contenders for connection")
 
-        for hint_obj in self._their_direct_hints:
-            # Check the hint type to see if we can support it (e.g. skip
-            # onion hints on a non-Tor client). Do not increase relay_delay
-            # unless we have at least one viable hint.
-            ep = self._endpoint_from_hint_obj(hint_obj)
-            if not ep:
-                continue
-            description = "->%s" % describe_hint_obj(hint_obj)
-            if self._tor:
-                description = "tor" + description
-            d = self._start_connector(ep, description)
-            contenders.append(d)
-            relay_delay = self.RELAY_DELAY
+    # TODO: add 2*TIMEOUT deadline for first generation, don't wait forever for
+    # the initial connection
 
-        # Start trying the relays a few seconds after we start to try the
-        # direct hints. The idea is to prefer direct connections, but not be
-        # afraid of using a relay when we have direct hints that don't
-        # resolve quickly. Many direct hints will be to unused local-network
-        # IP addresses, which won't answer, and would take the full TCP
-        # timeout (30s or more) to fail.
-
-        prioritized_relays = {}
-        for rh in self._our_relay_hints:
-            for hint_obj in rh.hints:
-                priority = hint_obj.priority
-                if priority not in prioritized_relays:
-                    prioritized_relays[priority] = set()
-                prioritized_relays[priority].add(hint_obj)
-
-        for priority in sorted(prioritized_relays, reverse=True):
-            for hint_obj in prioritized_relays[priority]:
-                ep = self._endpoint_from_hint_obj(hint_obj)
-                if not ep:
-                    continue
-                description = "->relay:%s" % describe_hint_obj(hint_obj)
-                if self._tor:
-                    description = "tor" + description
-                d = task.deferLater(self._reactor, relay_delay,
-                                    self._start_connector, ep, description,
-                                    is_relay=True)
-                contenders.append(d)
-            relay_delay += self.RELAY_DELAY
-
-        if not contenders:
-            raise TransitError("No contenders for connection")
-
-        winner = there_can_be_only_one(contenders)
-        return self._not_forever(2*TIMEOUT, winner)
-
-    def _not_forever(self, timeout, d):
-        """If the timer fires first, cancel the deferred. If the deferred fires
-        first, cancel the timer."""
-        t = self._reactor.callLater(timeout, d.cancel)
-        def _done(res):
-            if t.active():
-                t.cancel()
-            return res
-        d.addBoth(_done)
-        return d
-
-    def _build_relay_handshake(self):
-        return build_sided_relay_handshake(self._transit_key, self._side)
-
-    def _start_connector(self, ep, description, is_relay=False):
+    def _connect(self, h, ep, description, is_relay=False):
         relay_handshake = None
         if is_relay:
-            assert self._transit_key
-            relay_handshake = self._build_relay_handshake()
-        f = OutboundConnectionFactory(self, relay_handshake, description)
+            relay_handshake = build_sided_relay_handshake(self._dilation_key,
+                                                          self._side)
+        f = OutboundConnectionFactory(self, relay_handshake, self._dilation_key)
         d = ep.connect(f)
         # fires with protocol, or ConnectError
-        d.addCallback(lambda p: p.startNegotiation())
+        def _connected(p):
+            self._losing_connections.add(p)
+            # c might not be in _losing_connections, if it turned out to be a
+            # winner, which is why we use discard() and not remove()
+            p.when_disconnected().addCallback(self._losing_connections.discard)
+        d.addCallback(_connected)
         return d
 
     def _endpoint_from_hint_obj(self, hint):
@@ -416,6 +367,50 @@ class Connector:
                     return None
             return None
         if isinstance(hint, DirectTCPV1Hint):
-            return endpoints.HostnameEndpoint(self._reactor,
-                                              hint.hostname, hint.port)
+            return HostnameEndpoint(self._reactor, hint.hostname, hint.port)
         return None
+
+    # our Connection protocols call these
+    def good_frame(self, c, payload):
+        pass
+    
+    def bad_frame(self, c, payload):
+        pass
+
+    def select(self, c):
+        self._losing_connections.discard(c)
+        self._winner = c
+        # TODO...
+
+class Contender(object):
+    leader.upon(good_frame, enter=hopeful, outputs=[compete])
+    hopeful.upon(win, enter=active, outputs=[])
+
+    follower.upon(good_frame, enter=active, outputs=[select])
+
+    active.upon(good_frame, enter=active, outputs=[deliver_frame])
+
+@attrs
+class OutboundConnectionFactory(ClientFactory):
+    _connector = attrib(validator=provides(IDilationConnector))
+    _relay_handshake = attrib(validator=optional(instance_of(bytes)))
+    _dilation_key = attrib(validator=instance_of(bytes))
+    protocol = DilatedConnectionProtocol
+
+    def buildProtocol(self, addr):
+        p = self.protocol(self._connector, self._dilation_key)
+        p.factory = self
+        if self._relay_handshake is not None:
+            p.use_relay(self._relay_handshake)
+        return p
+
+@attrs
+class InboundConnectionFactory(ServerFactory):
+    _connector = attrib(validator=provides(IDilationConnector))
+    _dilation_key = attrib(validator=instance_of(bytes))
+    protocol = DilatedConnectionProtocol
+
+    def buildProtocol(self, addr):
+        p = self.protocol(self._connector, self._dilation_key)
+        p.factory = self
+        return p

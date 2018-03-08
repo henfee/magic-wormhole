@@ -394,3 +394,5 @@ class IJournal(Interface): # TODO: this needs to be public
 
 class IDilationManager(Interface):
     pass
+class IDilationConnector(Interface):
+    pass

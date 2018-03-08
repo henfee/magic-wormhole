@@ -20,7 +20,7 @@ from ._input import Input
 from ._code import Code, validate_code
 from ._terminator import Terminator
 from ._wordlist import PGPWordList
-from ._dilation.manager import DilationManager
+from ._dilation.manager import Dilator
 from .errors import (ServerError, LonelyError, WrongPasswordError,
                      OnlyOneCodeError, _UnknownPhaseError, WelcomeError)
 from .util import bytes_to_dict
@@ -59,7 +59,7 @@ class Boss(object):
         self._I = Input(self._timing)
         self._C = Code(self._timing)
         self._T = Terminator()
-        self._D = DilationManager()
+        self._D = Dilator()
 
         self._N.wire(self._M, self._I, self._RC, self._T)
         self._M.wire(self._N, self._RC, self._O, self._T)
@@ -73,7 +73,7 @@ class Boss(object):
         self._I.wire(self._C, self._L)
         self._C.wire(self, self._A, self._N, self._K, self._I)
         self._T.wire(self, self._RC, self._N, self._M)
-        self._D.wire() # TODO ???
+        self._D.wire(self._S)
 
     def _init_other_state(self):
         self._did_start_code = False
@@ -225,7 +225,7 @@ class Boss(object):
         d_mo = re.search(r'^dilate-\d+$', phase)
         if phase == "version":
             self._got_version(side, plaintext)
-        elif dmo:
+        elif d_mo:
             self._got_dilate(int(d_mo.groups(1)), plaintext)
         elif re.search(r'^\d+$', phase):
             self._got_phase(int(phase), plaintext)
@@ -311,11 +311,11 @@ class Boss(object):
 
     @m.output()
     def D_received_dilate(self, seqnum, plaintext):
-        assert isinstance(phase, six.integer_types), type(phase)
+        assert isinstance(seqnum, six.integer_types), type(seqnum)
         # strict phase order, no gaps
         self._rx_dilate_seqnum[seqnum] = plaintext
         while self._next_rx_dilate_seqnum in self._rx_dilate_seqnums:
-            m = _rx_dilate_seqnums.pop(self._next_rx_dilate_seqnum)
+            m = self._rx_dilate_seqnums.pop(self._next_rx_dilate_seqnum)
             self._D.received_dilate(m)
             self._next_rx_dilate_seqnum += 1
 
