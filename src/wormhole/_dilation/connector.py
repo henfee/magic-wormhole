@@ -8,14 +8,18 @@ from attr.validators import instance_of, provides, optional
 from automat import MethodicalMachine
 from zope.interface import implementer
 from twisted.internet.task import deferLater
+from twisted.internet.defer import DeferredList
 from twisted.internet.endpoints import HostnameEndpoint, serverFromString
 from twisted.internet.protocol import ClientFactory, ServerFactory
 from twisted.python import log
+from noise.connection import NoiseConnection
 from hkdf import Hkdf
-from .connection import DilatedConnectionProtocol
 from .. import ipaddrs # TODO: move into _dilation/
 from .._interfaces import IDilationConnector, IDilationManager
 from ..timing import DebugTiming
+from ..observer import Emptiness
+from .connection import DilatedConnectionProtocol
+from .roles import LEADER, FOLLOWER
 
 
 # These namedtuples are "hint objects". The JSON-serializable dictionaries
@@ -141,6 +145,9 @@ def build_sided_relay_handshake(key, side):
     token = HKDF(key, 32, CTXinfo=b"transit_relay_token")
     return b"please relay "+hexlify(token)+b" for side "+side.encode("ascii")+b"\n"
 
+PROLOGUE_LEADER   = b"Magic-Wormhole Dilation Handshake v1 Leader\n\n"
+PROLOGUE_FOLLOWER = b"Magic-Wormhole Dilation Handshake v1 Follower\n\n"
+NOISEPROTO = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
 
 @attrs
 @implementer(IDilationConnector)
@@ -184,6 +191,24 @@ class Connector:
                 {"type": "relay-v1"},
                 ]
 
+    def build_protocol(self, addr):
+        # encryption: let's use Noise NNpsk0 (or maybe NNpsk2). That uses
+        # ephemeral keys plus a pre-shared symmetric key (the Transit key), a
+        # different one for each potential connection.
+        noise = NoiseConnection.from_name(NOISEPROTO)
+        noise.set_psks(self._dilation_key)
+        if self._role is LEADER:
+            noise.set_as_initiator()
+            send_prologue = PROLOGUE_LEADER
+            expected_prologue = PROLOGUE_FOLLOWER
+        else:
+            noise.set_as_responder()
+            send_prologue = PROLOGUE_FOLLOWER
+            expected_prologue = PROLOGUE_LEADER
+        p = DilatedConnectionProtocol(self, noise,
+                                      send_prologue, expected_prologue)
+        return p
+
     @m.state(initial=True)
     def connecting(self): pass # pragma: no cover
     @m.state(initial=True)
@@ -225,6 +250,7 @@ class Connector:
     @m.output()
     def stop_other_connections(self):
         ds = [d.cancel() for d in self._pending_outbound_connections]
+        ds.extend([fm.halt for fm in self._contenders])
         ds.append(self._losing_connections.when_next_empty())
         [c.loseConnection() for c in self._losing_connections]
         return DeferredList(ds)
@@ -370,17 +396,46 @@ class Connector:
             return HostnameEndpoint(self._reactor, hint.hostname, hint.port)
         return None
 
-    # our Connection protocols call these
-    def good_frame(self, c, payload):
-        pass
-    
-    def bad_frame(self, c, payload):
-        pass
 
-    def select(self, c):
-        self._losing_connections.discard(c)
+    # Connection selection. All instances of DilatedConnectionProtocol which
+    # look viable get passed into our add_contender() method.
+
+    # On the Leader side, "viable" means we've seen their KCM frame, which is
+    # the first Noise-encrypted packet on any given connection, and it has an
+    # empty body. We gather viable connections until we see one that we like,
+    # or a timer expires. Then we "select" it, close the others, and tell our
+    # Manager to use it.
+
+    # On the Follower side, we'll only see a KCM on the one connection selected
+    # by the Leader, so the first viable connection wins.
+
+    # our Connection protocols call these
+    def got_handshake(self, c):
+        if self._role is FOLLOWER:
+            c.encrypt_and_send(b"") # follower sends KCM right away
+            # leader doesn't send KCM until selection finishes
+    def got_kcm(self, c): # TODO: send to add_candidate, use state machine
+        self._contenders.add(c)
+        if self._role is LEADER:
+            # for now, just accept the first one. TODO: be clever.
+            self._eventual_queue.eventually(self._select_winner, c)
+        else:
+            # the follower always uses the first contender, since that's the
+            # only one the leader picked
+            self._eventual_queue.eventually(self._select_winner, c)
+
+    def _select_winner(self, c):
+        if self._role is LEADER:
+            c.encrypt_and_send(b"") # leader sends KCM now
         self._winner = c
-        # TODO...
+        self._contenders.discard(c)
+        # TODO: shut down losing connections
+        #self._losing_connections.discard(c)
+
+        self.accept(c) # use the state machine
+        #c.select(self._manager) # subsequent frames go directly to the manager
+        #self._manager.connect(c) # manager will send frames to Connection
+
 
 class Contender(object):
     leader.upon(good_frame, enter=hopeful, outputs=[compete])
@@ -394,11 +449,9 @@ class Contender(object):
 class OutboundConnectionFactory(ClientFactory):
     _connector = attrib(validator=provides(IDilationConnector))
     _relay_handshake = attrib(validator=optional(instance_of(bytes)))
-    _dilation_key = attrib(validator=instance_of(bytes))
-    protocol = DilatedConnectionProtocol
 
     def buildProtocol(self, addr):
-        p = self.protocol(self._connector, self._dilation_key)
+        p = self._connector.build_protocol(addr)
         p.factory = self
         if self._relay_handshake is not None:
             p.use_relay(self._relay_handshake)
@@ -407,10 +460,9 @@ class OutboundConnectionFactory(ClientFactory):
 @attrs
 class InboundConnectionFactory(ServerFactory):
     _connector = attrib(validator=provides(IDilationConnector))
-    _dilation_key = attrib(validator=instance_of(bytes))
     protocol = DilatedConnectionProtocol
 
     def buildProtocol(self, addr):
-        p = self.protocol(self._connector, self._dilation_key)
+        p = self._connector.build_protocol(addr)
         p.factory = self
         return p

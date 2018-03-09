@@ -8,17 +8,15 @@ from twisted.python.internet import Protocol
 from noise.connection import NoiseConnection
 from noise.exceptions import NoiseInvalidMessage
 from .._interfaces import IDilationConnector
+from ..observer import OneShotObserver
 from .encode import to_be4, from_be4
-from .roles import LEADER
-
-PROLOGUE_LEADER   = b"Magic-Wormhole Dilation Handshake v1 Leader\n\n"
-PROLOGUE_FOLLOWER = b"Magic-Wormhole Dilation Handshake v1 Follower\n\n"
-NOISEPROTO = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
 
 RelayOK = namedtuple("RelayOk", [])
 Prologue = namedtuple("Prologue", [])
 Frame = namedtuple("Frame", ["frame"])
 Disconnect = namedtuple("Disconnect", [])
+KCM = namedtuple("KCM", [])
+Payload = namedtuple("Payload", ["payload"])
 
 def first(l):
     return l[0]
@@ -39,29 +37,18 @@ class DilatedConnectionProtocol(Protocol):
     """
 
     _connector = attrib(validator=provides(IDilationConnector))
-    _dilation_key = attrib(validator=instance_of(bytes))
-    _role = attrib()
+    _noise = attrib(validator=instance_of(NoiseConnection))
+    _send_prologue = attrib(validator=instance_of(bytes))
+    _expected_prologue = attrib(validator=instance_of(bytes))
     _got_prologue = False
 
     m = MethodicalMachine()
     set_trace = getattr(m, "_setTrace", lambda self, f: None)
 
     def __attrs_post_init__(self):
+        self._manager = None # set if/when we are selected
         self._disconnected = OneShotObserver()
         self._buffer = b""
-        # encryption: let's use Noise NNpsk0 (or maybe NNpsk2). That uses
-        # ephemeral keys plus a pre-shared symmetric key (the Transit key), a
-        # different one for each potential connection.
-        self._noise = NoiseConnection.from_name(NOISEPROTO)
-        self._noise.set_psks(self._dilation_key)
-        if self._role is LEADER:
-            self._noise.set_as_initiator()
-            self._send_prologue = PROLOGUE_LEADER
-            self._expected_prologue = PROLOGUE_FOLLOWER
-        else:
-            self._noise.set_as_responder()
-            self._send_prologue = PROLOGUE_FOLLOWER
-            self._expected_prologue = PROLOGUE_LEADER
         self._noise.start_handshake()
 
     def when_disconnected(self):
@@ -77,8 +64,10 @@ class DilatedConnectionProtocol(Protocol):
     def want_prologue(self): pass # pragma: no cover
     @m.state()
     def want_ephemeral(self): pass # pragma: no cover
-    @m.state(initial=True)
-    def ready(self): pass # pragma: no cover
+    @m.state()
+    def selecting(self): pass # pragma: no cover
+    @m.state(final=True)
+    def selected(self): pass # pragma: no cover
 
     @m.input()
     def use_relay(self): pass
@@ -92,6 +81,8 @@ class DilatedConnectionProtocol(Protocol):
     def got_prologue(self): pass
     @m.input()
     def got_frame(self, frame): pass
+    @m.input()
+    def select(self, manager): pass
 
     @m.output()
     def store_relay_handshake(self, relay_handshake):
@@ -152,23 +143,28 @@ class DilatedConnectionProtocol(Protocol):
     def process_handshake(self, frame):
         payload = self._noise.read_message()
         del payload # we don't send plaintext in the handshake
-        if self._role is LEADER:
-            self.kcm_leader_got_handshake()
-        else:
-            self.kcm_follower_got_handshake()
+        self._connector.got_handshake(self)
 
-    @m.output()
-    def process_decrypt(self, frame):
+    def _decrypt(self, frame):
         try:
-            payload = self._noise.decrypt(frame)
+            return self._noise.decrypt(frame)
         except NoiseInvalidMessage:
             # if this happens during tests, flunk the test
             log.err("bad inbound frame")
             self.loseConnection()
-            return
-        if payload is not None:
-            # this will deliver the payload to our Manager, if selected
-            self.kcm_good_frame(payload)
+            return None # TODO: handle this in decrypt_kcm/decrypt_payload
+
+    @m.output()
+    def decrypt_kcm(self, plaintext):
+        assert plaintext == b"", plaintext # KCM is supposed to be empty
+        return KCM()
+    @m.output()
+    def decrypt_payload(self, plaintext):
+        return Payload(plaintext)
+
+    @m.output()
+    def record_manager(self, manager):
+        self._manager = manager
 
     connecting_no_relay.upon(use_relay, enter=connecting_with_relay,
                              outputs=[store_relay_handshake])
@@ -188,10 +184,17 @@ class DilatedConnectionProtocol(Protocol):
     # the Noise mode we use (NNpsk0) has exactly one handshake message
     want_ephemeral.upon(got_more_data, enter=want_ephemeral,
                         outputs=[parse_frame], collector=first)
-    want_ephemeral.upon(got_frame, enter=ready, outputs=[process_handshake])
-    ready.upon(got_more_data, enter=ready,
-               outputs=[parse_frame], collector=first)
-    ready.upon(got_frame, enter=ready, outputs=[process_decrypt])
+    want_ephemeral.upon(got_frame, enter=selecting,
+                        outputs=[process_handshake], collector=first)
+    selecting.upon(got_more_data, enter=selecting,
+                   outputs=[parse_frame], collector=first)
+    selecting.upon(got_frame, enter=selecting,
+                   outputs=[decrypt_kcm], collector=first)
+    selecting.upon(select, enter=selected, outputs=[record_manager])
+    selected.upon(got_more_data, enter=selected,
+                  outputs=[parse_frame], collector=first)
+    selected.upon(got_frame, enter=selecting,
+                  outputs=[decrypt_payload], collector=first)
 
     def connectionMade(self):
         self.connected()
@@ -199,13 +202,19 @@ class DilatedConnectionProtocol(Protocol):
     def dataReceived(self, data):
         self._buffer += data
         while True:
-            token = self.got_more_data()
+            token = self.got_more_data() # parsing depends upon protocol state
             if isinstance(token, RelayOK):
                 self.got_relay_ok()
             elif isinstance(token, Prologue):
                 self.got_prologue()
             elif isinstance(token, Frame):
-                self.got_frame(token.frame)
+                payload = self.got_frame(token.frame)
+                if isinstance(payload, KCM):
+                    # we haven't been selected yet, so this must be the KCM
+                    self._connector.got_kcm(self)
+                elif isinstance(payload, Payload):
+                    # we've been selected, forward frames upstairs
+                    self._manager.good_frame(payload.payload)
             elif isinstance(token, Disconnect):
                 self.loseConnection()
             else:
@@ -223,107 +232,12 @@ class DilatedConnectionProtocol(Protocol):
         self.transport.loseConnection()
 
 
-# This is a separate Confirmation machine. We send an empty payload in the
-# first encrypted Noise packet in each direction, and call it the KCM (Key
-# Confirmation Message) frame. The Follower sends this as soon as the
-# encrypted connection is established (which is right after the ephemeral
-# key packet arrives at the follower), then it waits for a response. The
-# Leader waits to see this KCM, which indicates that the connection is a
-# viable contender, and it goes into the selection pool. Later, when the
-# pool resolves and a winner is picked, the Leader sends its own KCM on the
-# winning connection and drops the others. When the Follower sees that KCM,
-# it selects that connection for use and drops the others too.
-
-    # This would be too messy to merge into the machine above: the distinction
-    # between leader and follower would double the number of states.
-
-@attr
-class KCMLeader(object):
-    _connection = attrib(validator=instance_of(DilatedConnectionProtocol))
-
-    m = MethodicalMachine()
-    set_trace = getattr(m, "_setTrace", lambda self, f: None)
-
-    @m.state(initial=True)
-    def IDLE(self): pass # pragma: no cover
-    @m.state()
-    def WAITING(self): pass # pragma: no cover
-    @m.state()
-    def SELECTING(self): pass # pragma: no cover
-    @m.state()
-    def SELECTED(self): pass # pragma: no cover
-
-    # we "start" as soon as the handshake has been received
-    @m.input()
-    def got_handshake(self):
-        pass
-    @m.input()
-    def good_frame(self, frame):
-        pass
-    @m.input()
-    def win(self):
-        pass
-
-    @m.output()
-    def add_contender(self, frame):
-        # note: add_contender should not call our .win right away, else Automat
-        # will probably get confused. Use eventually().
-        self._connector.add_contender(self._connection)
-    @m.output()
-    def send_kcm(self):
-        self._connection.encrypt_and_send(b"")
-
-    @m.output()
-    def select(self):
-        self._connector.select(self)
-
-    @m.output()
-    def deliver_frame(self, frame):
-        self._manager.good_frame(frame)
-
-    IDLE.upon(got_handshake, enter=WAITING, outputs=[]) # do not send KCM yet
-    WAITING.upon(good_frame, enter=SELECTING, outputs=[add_contender])
-    SELECTING.upon(win, enter=SELECTED, outputs=[select, send_kcm]) # now
-    SELECTED.upon(good_frame, enter=SELECTED, outputs=[deliver_frame])
-
-
-class KCMFollower(object):
-    m = MethodicalMachine()
-    set_trace = getattr(m, "_setTrace", lambda self, f: None)
-
-    @m.state(initial=True)
-    def IDLE(self): pass # pragma: no cover
-    @m.state()
-    def WAITING(self): pass # pragma: no cover
-    @m.state()
-    def SELECTING(self): pass # pragma: no cover
-    @m.state()
-    def SELECTED(self): pass # pragma: no cover
-
-    # we "start" as soon as the handshake has been received
-    @m.input()
-    def got_handshake(self):
-        pass
-    @m.input()
-    def good_frame(self, frame):
-        pass
-    @m.input()
-    def win(self):
-        pass
-
-    @m.output()
-    def send_kcm(self):
-        self._connection.encrypt_and_send(b"")
-
-    @m.output()
-    def select(self, frame):
-        assert frame == b"", frame # empty KCM frame
-        self._connector.select(self)
-
-    @m.output()
-    def deliver_frame(self, frame):
-        self._manager.good_frame(frame)
-
-    IDLE.upon(got_handshake, enter=SELECTING, outputs=[send_kcm])
-    SELECTING.upon(good_frame, enter=SELECTED, outputs=[select])
-    SELECTED.upon(good_frame, enter=SELECTED, outputs=[deliver_frame])
+# The first encrypted Noise packet in each direction is called the KCM (Key
+# Confirmation Message) and it has an empty payload. The Follower sends
+# this as soon as the encrypted connection is established (which is right after
+# the ephemeral key packet arrives at the follower), then it waits for a
+# response. The Leader waits to see this KCM, which indicates that the
+# connection is a viable contender, and it goes into the selection pool. Later,
+# when the pool resolves and a winner is picked, the Leader sends its own KCM
+# on the winning connection and drops the others. When the Follower sees that
+# KCM, it selects that connection for use and drops the others too.
