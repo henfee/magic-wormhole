@@ -214,8 +214,11 @@ class Connector:
     @m.state(initial=True)
     def connected(self): pass # pragma: no cover
 
+    # TODO: unify the tense of these method-name verbs
     @m.input()
     def listener_ready(self, hint_objs): pass
+    @m.input()
+    def add_relay(self, hint_objs): pass
     @m.input()
     def got_hints(self, hint_structs): pass
     @m.input()
@@ -229,19 +232,36 @@ class Connector:
     def use_hints(self, hint_structs):
         self._use_hints(filter(lambda h: h, # ignore None, unrecognizable
                                [parse_hint(hs) for hs in hint_structs]))
-    @m.output()
-    def consider(self, c):
-        # for now, just accept the first one
-        self._eventual_queue.eventually(self.accept, c)
-    @m.output()
-    def select(self, c):
-        self._winner = c
-        self.stop_listeners()
-        self.stop_connections()
-        self._manager.use_connection(c)
+
     @m.output()
     def publish_hints(self, hint_objs):
         self._manager.send_hints([encode_hint(h) for h in hint_objs])
+
+    @m.output()
+    def consider(self, c):
+        self._contenders.add(c)
+        if self._role is LEADER:
+            # for now, just accept the first one. TODO: be clever.
+            self._eventual_queue.eventually(self.accept, c)
+        else:
+            # the follower always uses the first contender, since that's the
+            # only one the leader picked
+            self._eventual_queue.eventually(self.accept, c)
+
+    @m.output()
+    def select_and_stop_remaining(self, c):
+        if self._role is LEADER:
+            c.encrypt_and_send(b"") # leader sends KCM now
+        self._winner = c
+        self._contenders.discard(c) # remove winner from losers
+        # TODO: shut down losing connections
+        #self.stop_listeners()
+        #self.stop_connections()
+        #self._losing_connections.discard(c)
+
+        c.select(self._manager) # subsequent frames go directly to the manager
+        self._manager.use_connection(c) # manager sends frames to Connection
+
     @m.output()
     def stop_listeners(self):
         d = DeferredList([l.stopListening() for l in self._listeners])
@@ -257,18 +277,23 @@ class Connector:
 
 
     connecting.upon(listener_ready, enter=connecting, outputs=[publish_hints])
+    connecting.upon(add_relay, enter=connecting, outputs=[connect_to_relay,
+                                                          publish_hints])
     connecting.upon(got_hints, enter=connecting, outputs=[use_hints])
     connecting.upon(add_candidate, enter=connecting, outputs=[consider])
-    connecting.upon(accept, enter=connected, outputs=[select])
+    connecting.upon(accept, enter=connected, outputs=[select_and_stop_remaining])
     connecting.upon(stop, enter=connecting, outputs=[stop_listeners,
-                                                     stop_connections])
+                                                     stop_all_connections])
 
-    # once connected, we ignore everything
+    # once connected, we ignore everything except stop
     connected.upon(listener_ready, enter=connected, outputs=[])
+    connected.upon(add_relay, enter=connected, outputs=[])
     connected.upon(got_hints, enter=connected, outputs=[])
     connected.upon(add_candidate, enter=connected, outputs=[])
     connected.upon(accept, enter=connected, outputs=[])
-    connected.upon(stop, enter=connected, outputs=[])
+    connected.upon(stop, enter=connected, outputs=[stop_listeners,
+                                                   stop_all_connections])
+
 
     # from Manager: start, got_hints, stop
     # maybe add_candidate, accept
@@ -414,36 +439,9 @@ class Connector:
         if self._role is FOLLOWER:
             c.encrypt_and_send(b"") # follower sends KCM right away
             # leader doesn't send KCM until selection finishes
-    def got_kcm(self, c): # TODO: send to add_candidate, use state machine
-        self._contenders.add(c)
-        if self._role is LEADER:
-            # for now, just accept the first one. TODO: be clever.
-            self._eventual_queue.eventually(self._select_winner, c)
-        else:
-            # the follower always uses the first contender, since that's the
-            # only one the leader picked
-            self._eventual_queue.eventually(self._select_winner, c)
 
-    def _select_winner(self, c):
-        if self._role is LEADER:
-            c.encrypt_and_send(b"") # leader sends KCM now
-        self._winner = c
-        self._contenders.discard(c)
-        # TODO: shut down losing connections
-        #self._losing_connections.discard(c)
-
-        self.accept(c) # use the state machine
-        #c.select(self._manager) # subsequent frames go directly to the manager
-        #self._manager.connect(c) # manager will send frames to Connection
-
-
-class Contender(object):
-    leader.upon(good_frame, enter=hopeful, outputs=[compete])
-    hopeful.upon(win, enter=active, outputs=[])
-
-    follower.upon(good_frame, enter=active, outputs=[select])
-
-    active.upon(good_frame, enter=active, outputs=[deliver_frame])
+    def got_kcm(self, c):
+        self.add_candidate(c)
 
 @attrs
 class OutboundConnectionFactory(ClientFactory):

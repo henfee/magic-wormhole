@@ -196,6 +196,11 @@ class DilatedConnectionProtocol(Protocol):
     selected.upon(got_frame, enter=selecting,
                   outputs=[decrypt_payload], collector=first)
 
+    # TODO: consider adding a second state machine which controls what we do
+    # with parsed frames. The first FSM would have
+    # connecting/want_relay/want_prologue/doing_frames, and the second would
+    # have want_ephemeral/selecting/selected.
+
     def connectionMade(self):
         self.connected()
 
