@@ -4,9 +4,7 @@ from twisted.internet.defer import inlineCallbacks, returnValue, Deferred
 from twisted.internet.task import react
 from twisted.internet.protocol import Protocol, Factory
 from . import create
-from twisted.python import log
-import sys
-#log.startLogging(sys.stderr)
+#from twisted.python import log; import sys; log.startLogging(sys.stderr)
 
 class Options(usage.Options):
     pass
