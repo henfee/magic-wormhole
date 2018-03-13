@@ -223,7 +223,7 @@ class Connector:
     @m.input()
     def add_relay(self, hint_objs): pass
     @m.input()
-    def got_hints(self, hint_structs): pass
+    def got_hints(self, hint_objs): pass
     @m.input()
     def add_candidate(self, c): # called by DilatedConnectionProtocol
         pass
@@ -233,9 +233,8 @@ class Connector:
     def stop(self): pass
 
     @m.output()
-    def use_hints(self, hint_structs):
-        self._use_hints(filter(lambda h: h, # ignore None, unrecognizable
-                               [parse_hint(hs) for hs in hint_structs]))
+    def use_hints(self, hint_objs):
+        self._use_hints(hint_objs)
 
     @m.output()
     def publish_hints(self, hint_objs):

@@ -12,7 +12,7 @@ from .encode import to_be4
 from .subchannel import (SubChannel, _SubchannelAddress, _WormholeAddress,
                          ControlEndpoint, SubchannelConnectorEndpoint,
                          SubchannelListenerEndpoint)
-from .connector import Connector
+from .connector import Connector, parse_hint
 from .roles import LEADER, FOLLOWER
 
 PAUSED, RESUMED = object(), object()
@@ -329,7 +329,7 @@ class ManagerLeader(_ManagerBase):
     @m.input()
     def rx_DILATE(self): pass # pragma: no cover
     @m.input()
-    def rx_HINTS(self, hints): pass # pragma: no cover
+    def rx_HINTS(self, hint_message): pass # pragma: no cover
 
     @m.input()
     def connection_made(self, c): pass # pragma: no cover
@@ -353,8 +353,10 @@ class ManagerLeader(_ManagerBase):
     # is on the subclass, not the shared superclass
 
     @m.output()
-    def use_hints(self, hints):
-        self._connector.got_hints(hints)
+    def use_hints(self, hint_message):
+        hint_objs = filter(lambda h: h, # ignore None, unrecognizable
+                           [parse_hint(hs) for hs in hint_message["hints"]])
+        self._connector.got_hints(hint_objs)
     @m.output()
     def stop_connecting(self):
         self._connector.stop()
@@ -367,8 +369,11 @@ class ManagerLeader(_ManagerBase):
     @m.output()
     def signal_error(self):
         pass # TODO
+    @m.output()
+    def signal_error_hints(self, hint_message):
+        pass # TODO
 
-    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error]) # too early
+    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error_hints]) # too early
     IDLE.upon(stop, enter=STOPPED, outputs=[])
     IDLE.upon(rx_PLEASE, enter=WANTED, outputs=[])
     IDLE.upon(start, enter=WANTING, outputs=[])
@@ -430,7 +435,7 @@ class ManagerFollower(_ManagerBase):
     @m.input()
     def rx_DILATE(self): pass # pragma: no cover
     @m.input()
-    def rx_HINTS(self, hints): pass # pragma: no cover
+    def rx_HINTS(self, hint_message): pass # pragma: no cover
 
     @m.input()
     def connection_made(self, c): pass # pragma: no cover
@@ -455,8 +460,10 @@ class ManagerFollower(_ManagerBase):
     # is on the subclass, not the shared superclass
 
     @m.output()
-    def use_hints(self, hints):
-        self._connector.got_hints(hints)
+    def use_hints(self, hint_message):
+        hint_objs = filter(lambda h: h, # ignore None, unrecognizable
+                           [parse_hint(hs) for hs in hint_message["hints"]])
+        self._connector.got_hints(hint_objs)
     @m.output()
     def stop_connecting(self):
         self._connector.stop()
@@ -469,8 +476,11 @@ class ManagerFollower(_ManagerBase):
     @m.output()
     def signal_error(self):
         pass # TODO
+    @m.output()
+    def signal_error_hints(self, hint_message):
+        pass # TODO
 
-    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error]) # too early
+    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error_hints]) # too early
     IDLE.upon(rx_DILATE, enter=STOPPED, outputs=[signal_error]) # too early
     # leader shouldn't send us DILATE before receiving our PLEASE
     IDLE.upon(stop, enter=STOPPED, outputs=[])

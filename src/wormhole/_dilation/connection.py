@@ -83,8 +83,8 @@ class _Framer(object):
     def got_prologue(self): pass
 
     @m.output()
-    def store_relay_handshake(self, handshake):
-        self._outbound_relay_handshake = handshake
+    def store_relay_handshake(self, relay_handshake):
+        self._outbound_relay_handshake = relay_handshake
         self._expected_relay_handshake = b"ok\n"
     @m.output()
     def send_relay_handshake(self):
@@ -398,7 +398,7 @@ class DilatedConnectionProtocol(Protocol):
         self._connector.add_candidate(self)
 
     @m.output()
-    def record_manager(self, manager):
+    def set_manager(self, manager):
         self._manager = manager
 
     @m.output()
@@ -410,7 +410,7 @@ class DilatedConnectionProtocol(Protocol):
         self._manager.got_record(record)
 
     unselected.upon(got_kcm, outputs=[add_candidate], enter=selecting)
-    selecting.upon(select, outputs=[record_manager, can_send_records], enter=selected)
+    selecting.upon(select, outputs=[set_manager, can_send_records], enter=selected)
     selected.upon(got_record, outputs=[deliver_record], enter=selected)
 
     # called by Connector
@@ -423,7 +423,7 @@ class DilatedConnectionProtocol(Protocol):
 
     @m.input()
     def select(self, manager):
-        pass # fires record_manager()
+        pass # fires set_manager()
 
     # called by Manager
     def send_record(self, record):
