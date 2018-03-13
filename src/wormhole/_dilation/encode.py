@@ -9,6 +9,8 @@ def to_be4(value):
         raise ValueError
     return struct.pack(">L", value)
 def from_be4(b):
+    if not isinstance(b, bytes):
+        raise TypeError(repr(b))
     if len(b) != 4:
         raise ValueError
-    return struct.unpack(">L")[0]
+    return struct.unpack(">L", b)[0]

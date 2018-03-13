@@ -13,3 +13,13 @@ class Encoding(unittest.TestCase):
         with self.assertRaises(ValueError):
             to_be4(2**32)
 
+        self.assertEqual(from_be4(b"\x00\x00\x00\x00"), 0)
+        self.assertEqual(from_be4(b"\x00\x00\x00\x01"), 1)
+        self.assertEqual(from_be4(b"\x00\x00\x01\x00"), 256)
+        self.assertEqual(from_be4(b"\x00\x00\x01\x01"), 257)
+
+        with self.assertRaises(TypeError):
+            from_be4(0)
+        with self.assertRaises(ValueError):
+            from_be4(b"\x01\x00\x00\x00\x00")
+
