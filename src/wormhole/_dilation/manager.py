@@ -5,7 +5,7 @@ from automat import MethodicalMachine
 from zope.interface import implementer
 from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
 from twisted.python import log
-from .._interfaces import IDilationManager, ISend
+from .._interfaces import IDilator, IDilationManager, ISend
 from ..util import dict_to_bytes, bytes_to_dict
 from ..observer import OneShotObserver
 from .encode import to_be4
@@ -518,7 +518,7 @@ class ManagerFollower(_ManagerBase):
         self._next_outbound_seqnum += 2
         return to_be4(scid_num)
 
-
+@implementer(IDilator)
 class Dilator(object):
     """I launch the dilation process.
 
@@ -529,6 +529,9 @@ class Dilator(object):
     connection, they are capable of dilating, and which side we're on),
     then we build a DilationManager and hand control to it.
     """
+
+    def __init__(self):
+        self._got_versions_d = Deferred()
 
     def wire(self, sender):
         self._S = ISend(sender)

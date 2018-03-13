@@ -8,7 +8,8 @@ from .. import (errors, timing, _order, _receive, _key, _code, _lister, _boss,
                 _rendezvous)
 from .._interfaces import (IKey, IReceive, IBoss, ISend, IMailbox, IOrder,
                            IRendezvousConnector, ILister, IInput, IAllocator,
-                           INameplate, ICode, IWordlist, ITerminator)
+                           INameplate, ICode, IWordlist, ITerminator,
+                           IDilator)
 from .._key import derive_key, derive_phase_key, encrypt_data
 from ..journal import ImmediateJournal
 from ..util import (dict_to_bytes, bytes_to_dict,
@@ -1228,6 +1229,7 @@ class Boss(unittest.TestCase):
         b._RC = Dummy("rc", events, IRendezvousConnector, "start")
         b._C = Dummy("c", events, ICode,
                      "allocate_code", "input_code", "set_code")
+        b._D = Dummy("d", events, IDilator, "got_wormhole_versions")
         return b, events
 
     def test_basic(self):
@@ -1255,6 +1257,7 @@ class Boss(unittest.TestCase):
         self.assertEqual(events, [("w.got_key", b"key"),
                                   ("w.got_verifier", b"verifier"),
                                   ("w.got_wormhole_versions", "side", "side", {}),
+                                  ("d.got_wormhole_versions", "side", "side", {}),
                                   ("w.got_versions", {}),
                                   ("w.received", b"msg1"),
                                   ])

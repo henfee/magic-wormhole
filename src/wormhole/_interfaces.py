@@ -392,6 +392,8 @@ class IInputHelper(Interface):
 class IJournal(Interface): # TODO: this needs to be public
     pass
 
+class IDilator(Interface):
+    pass
 class IDilationManager(Interface):
     pass
 class IDilationConnector(Interface):
