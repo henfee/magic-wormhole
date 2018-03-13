@@ -91,8 +91,8 @@ class Sender:
         # we start it now so Transit can build listening sockets (especially
         # onion services) in parallel with waiting for the user to transcribe
         # the code).
-        if self._args.what:
-            transit_d = w.dilate()
+        #if self._args.what:
+        #    transit_d = w.dilate()
 
         welcome = yield w.get_welcome()
         handle_welcome(welcome, self._args.relay_url, __version__,

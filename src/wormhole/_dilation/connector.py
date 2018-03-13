@@ -12,7 +12,6 @@ from twisted.internet.defer import DeferredList
 from twisted.internet.endpoints import HostnameEndpoint, serverFromString
 from twisted.internet.protocol import ClientFactory, ServerFactory
 from twisted.python import log
-from noise.connection import NoiseConnection
 from hkdf import Hkdf
 from .. import ipaddrs # TODO: move into _dilation/
 from .._interfaces import IDilationConnector, IDilationManager
@@ -151,7 +150,7 @@ NOISEPROTO = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
 
 @attrs
 @implementer(IDilationConnector)
-class Connector:
+class Connector(object):
     _dilation_key = attrib(validator=instance_of(type(b"")))
     _relay_url = attrib(validator=optional(instance_of(str)))
     _manager = attrib(validator=provides(IDilationManager))
@@ -196,6 +195,7 @@ class Connector:
         # encryption: let's use Noise NNpsk0 (or maybe NNpsk2). That uses
         # ephemeral keys plus a pre-shared symmetric key (the Transit key), a
         # different one for each potential connection.
+        from noise.connection import NoiseConnection
         noise = NoiseConnection.from_name(NOISEPROTO)
         noise.set_psks(self._dilation_key)
         if self._role is LEADER:
@@ -465,7 +465,7 @@ class Connector:
         self.add_candidate(c)
 
 @attrs
-class OutboundConnectionFactory(ClientFactory):
+class OutboundConnectionFactory(ClientFactory, object):
     _connector = attrib(validator=provides(IDilationConnector))
     _relay_handshake = attrib(validator=optional(instance_of(bytes)))
 
@@ -477,7 +477,7 @@ class OutboundConnectionFactory(ClientFactory):
         return p
 
 @attrs
-class InboundConnectionFactory(ServerFactory):
+class InboundConnectionFactory(ServerFactory, object):
     _connector = attrib(validator=provides(IDilationConnector))
     protocol = DilatedConnectionProtocol
 

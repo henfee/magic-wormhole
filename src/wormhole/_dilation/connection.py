@@ -6,7 +6,6 @@ from automat import MethodicalMachine
 from twisted.python import log
 from twisted.internet.protocol import Protocol
 from twisted.internet.interfaces import ITransport
-from noise.exceptions import NoiseInvalidMessage
 from .._interfaces import IDilationConnector
 from ..observer import OneShotObserver
 from .encode import to_be4, from_be4
@@ -282,6 +281,7 @@ class _Record(object):
 
     @n.output()
     def process_handshake(self, frame):
+        from noise.exceptions import NoiseInvalidMessage
         try:
             payload = self._noise.read_message(frame)
             # Noise can include unencrypted data in the handshake, but we don't
@@ -294,6 +294,7 @@ class _Record(object):
 
     @n.output()
     def decrypt_message(self, frame):
+        from noise.exceptions import NoiseInvalidMessage
         try:
             message = self._noise.decrypt(frame)
         except NoiseInvalidMessage as e:
@@ -346,7 +347,7 @@ def encode_record(r):
 
 
 @attrs
-class DilatedConnectionProtocol(Protocol):
+class DilatedConnectionProtocol(Protocol, object):
     """I manage an L2 connection.
 
     When a new L2 connection is needed (as determined by the Leader),

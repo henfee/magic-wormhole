@@ -35,7 +35,7 @@ setup(name="magic-wormhole",
           "click",
           "humanize",
           "txtorcon >= 0.19.3",
-          "noiseprotocol",
+          #"noiseprotocol",
       ],
       extras_require={
           ':sys_platform=="win32"': ["pypiwin32"],
