@@ -118,8 +118,11 @@ class SubChannel(object):
         # we're deleted momentarily
 
     @m.output()
-    def error_closed(self):
-        raise AlreadyClosedError("write/loseConnection not allowed on closed subchannel")
+    def error_closed_write(self, data):
+        raise AlreadyClosedError("write not allowed on closed subchannel")
+    @m.output()
+    def error_closed_close(self):
+        raise AlreadyClosedError("loseConnection not allowed on closed subchannel")
 
     # primary transitions
     open.upon(remote_data, enter=open, outputs=[signal_dataReceived])
@@ -131,8 +134,8 @@ class SubChannel(object):
 
     # error cases
     # we won't ever see an OPEN, since L4 will log+ignore those for us
-    closing.upon(local_data, enter=closing, outputs=[error_closed])
-    closing.upon(local_close, enter=closing, outputs=[error_closed])
+    closing.upon(local_data, enter=closing, outputs=[error_closed_write])
+    closing.upon(local_close, enter=closing, outputs=[error_closed_close])
     # the CLOSED state won't ever see messages, since we'll be deleted
 
     # our endpoints use this

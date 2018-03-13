@@ -396,3 +396,5 @@ class IDilationManager(Interface):
     pass
 class IDilationConnector(Interface):
     pass
+class ISubChannel(Interface):
+    pass

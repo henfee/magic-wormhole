@@ -137,7 +137,7 @@ class _ManagerBase(object):
 
     # from our active L2 connection
 
-    def bad_frame(self, c):
+    def bad_frame(self, c):# TODO: delete this
         if self._selected_l2 is None:
             # well, we certainly aren't selecting this one
             c.disconnect()

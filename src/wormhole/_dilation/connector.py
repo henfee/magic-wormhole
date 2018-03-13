@@ -17,7 +17,7 @@ from hkdf import Hkdf
 from .. import ipaddrs # TODO: move into _dilation/
 from .._interfaces import IDilationConnector, IDilationManager
 from ..timing import DebugTiming
-from ..observer import Emptiness
+from ..observer import EmptyableSet
 from .connection import DilatedConnectionProtocol
 from .roles import LEADER, FOLLOWER
 
@@ -178,9 +178,10 @@ class Connector:
         else:
             self._transit_relays = []
         self._listeners = set() # IListeningPorts that can be stopped
-        self._pending_outbound_connections = set() # Deferreds to cancel
-        self._losing_connections = Emptiness() # Protocols that can be stopped
-        self._winner = None
+        self._pending_connectors = set() # Deferreds that can be cancelled
+        self._pending_connections = EmptyableSet() # Protocols to be stopped
+        self._contenders = set() # viable connections
+        self._winning_connection = None
         self._timing = self._timing or DebugTiming()
         self._timing.add("transit")
 
@@ -199,20 +200,22 @@ class Connector:
         noise.set_psks(self._dilation_key)
         if self._role is LEADER:
             noise.set_as_initiator()
-            send_prologue = PROLOGUE_LEADER
-            expected_prologue = PROLOGUE_FOLLOWER
+            outbound_prologue = PROLOGUE_LEADER
+            inbound_prologue = PROLOGUE_FOLLOWER
         else:
             noise.set_as_responder()
-            send_prologue = PROLOGUE_FOLLOWER
-            expected_prologue = PROLOGUE_LEADER
+            outbound_prologue = PROLOGUE_FOLLOWER
+            inbound_prologue = PROLOGUE_LEADER
         p = DilatedConnectionProtocol(self, noise,
-                                      send_prologue, expected_prologue)
+                                      outbound_prologue, inbound_prologue)
         return p
 
     @m.state(initial=True)
     def connecting(self): pass # pragma: no cover
-    @m.state(initial=True)
+    @m.state()
     def connected(self): pass # pragma: no cover
+    @m.state(terminal=True)
+    def stopped(self): pass # pragma: no cover
 
     # TODO: unify the tense of these method-name verbs
     @m.input()
@@ -222,7 +225,8 @@ class Connector:
     @m.input()
     def got_hints(self, hint_structs): pass
     @m.input()
-    def add_candidate(self, c): pass
+    def add_candidate(self, c): # called by DilatedConnectionProtocol
+        pass
     @m.input()
     def accept(self, c): pass
     @m.input()
@@ -252,38 +256,57 @@ class Connector:
     def select_and_stop_remaining(self, c):
         if self._role is LEADER:
             c.encrypt_and_send(b"") # leader sends KCM now
-        self._winner = c
-        self._contenders.discard(c) # remove winner from losers
-        # TODO: shut down losing connections
-        #self.stop_listeners()
-        #self.stop_connections()
-        #self._losing_connections.discard(c)
+        self._winning_connection = c
+        self._contenders.clear() # we no longer care who else came close
+        # remove this winner from the losers, so we don't shut it down
+        self._pending_connections.discard(c)
+        # shut down losing connections
+        self.stop_listeners() # TODO: maybe keep it open? NAT/p2p assist
+        self.stop_pending_connectors()
+        self.stop_pending_connections()
 
         c.select(self._manager) # subsequent frames go directly to the manager
         self._manager.use_connection(c) # manager sends frames to Connection
 
     @m.output()
+    def stop_everything(self):
+        self.stop_listeners()
+        self.stop_pending_connectors()
+        self.stop_pending_connections()
+        self.break_cycles()
+
     def stop_listeners(self):
         d = DeferredList([l.stopListening() for l in self._listeners])
         self._listeners.clear()
         return d # synchronization for tests
-    @m.output()
-    def stop_other_connections(self):
-        ds = [d.cancel() for d in self._pending_outbound_connections]
-        ds.extend([fm.halt for fm in self._contenders])
-        ds.append(self._losing_connections.when_next_empty())
-        [c.loseConnection() for c in self._losing_connections]
-        return DeferredList(ds)
 
+    def stop_pending_connectors(self):
+        return DeferredList([d.cancel() for d in self._pending_connectors])
+
+    def stop_pending_connections(self):
+        d = self._pending_connections.when_next_empty()
+        [c.loseConnection() for c in self._pending_connections]
+        return d
+
+    def stop_winner(self):
+        d = self._winner.when_disconnected()
+        self._winner.disconnect()
+        return d
+
+    def break_cycles(self):
+        # help GC by forgetting references to things that reference us
+        self._listeners.clear()
+        self._pending_connectors.clear()
+        self._pending_connections.clear()
+        self._winner = None
 
     connecting.upon(listener_ready, enter=connecting, outputs=[publish_hints])
-    connecting.upon(add_relay, enter=connecting, outputs=[connect_to_relay,
+    connecting.upon(add_relay, enter=connecting, outputs=[use_hints,
                                                           publish_hints])
     connecting.upon(got_hints, enter=connecting, outputs=[use_hints])
     connecting.upon(add_candidate, enter=connecting, outputs=[consider])
     connecting.upon(accept, enter=connected, outputs=[select_and_stop_remaining])
-    connecting.upon(stop, enter=connecting, outputs=[stop_listeners,
-                                                     stop_all_connections])
+    connecting.upon(stop, enter=stopped, outputs=[stop_everything])
 
     # once connected, we ignore everything except stop
     connected.upon(listener_ready, enter=connected, outputs=[])
@@ -291,8 +314,7 @@ class Connector:
     connected.upon(got_hints, enter=connected, outputs=[])
     connected.upon(add_candidate, enter=connected, outputs=[])
     connected.upon(accept, enter=connected, outputs=[])
-    connected.upon(stop, enter=connected, outputs=[stop_listeners,
-                                                   stop_all_connections])
+    connected.upon(stop, enter=stopped, outputs=[stop_everything])
 
 
     # from Manager: start, got_hints, stop
@@ -347,7 +369,7 @@ class Connector:
                 desc = describe_hint_obj(h, False, self._tor)
                 d = deferLater(self._reactor, delay,
                                self._connect, ep, desc, is_relay=False)
-                self._pending_outbound_connections.add(d)
+                self._pending_connectors.add(d)
                 # Make all direct connections immediately. Later, we'll change
                 # the add_candidate() function to look at the priority when
                 # deciding whether to accept a successful connection or not,
@@ -383,7 +405,7 @@ class Connector:
                     desc = describe_hint_obj(h, True, self._tor)
                     d = deferLater(self._reactor, delay,
                                    self._connect, ep, desc, is_relay=True)
-                    self._pending_outbound_connections.add(d)
+                    self._pending_connectors.add(d)
         # TODO:
         #if not contenders:
         #    raise TransitError("No contenders for connection")
@@ -400,10 +422,10 @@ class Connector:
         d = ep.connect(f)
         # fires with protocol, or ConnectError
         def _connected(p):
-            self._losing_connections.add(p)
-            # c might not be in _losing_connections, if it turned out to be a
+            self._pending_connections.add(p)
+            # c might not be in _pending_connections, if it turned out to be a
             # winner, which is why we use discard() and not remove()
-            p.when_disconnected().addCallback(self._losing_connections.discard)
+            p.when_disconnected().addCallback(self._pending_connections.discard)
         d.addCallback(_connected)
         return d
 
@@ -434,7 +456,7 @@ class Connector:
     # On the Follower side, we'll only see a KCM on the one connection selected
     # by the Leader, so the first viable connection wins.
 
-    # our Connection protocols call these
+    # our Connection protocols call: add_candidate
     def got_handshake(self, c):
         if self._role is FOLLOWER:
             c.encrypt_and_send(b"") # follower sends KCM right away
