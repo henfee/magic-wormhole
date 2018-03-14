@@ -13,6 +13,7 @@ from ._boss import Boss
 from ._key import derive_key
 from .errors import NoKeyError, WormholeClosed
 from .util import to_bytes
+from ._dilation.connector import Connector
 
 # We can provide different APIs to different apps:
 # * Deferreds
@@ -92,6 +93,8 @@ class _DelegatedWormhole(object):
         self._key = key # for derive_key()
     def got_verifier(self, verifier):
         self._delegate.wormhole_got_verifier(verifier)
+    def got_wormhole_versions(self, our_side, their_side, wormhole_versions):
+        pass # internal, not delegated
     def got_versions(self, versions):
         self._delegate.wormhole_got_versions(versions)
     def received(self, plaintext):
@@ -101,12 +104,14 @@ class _DelegatedWormhole(object):
 
 @implementer(IWormhole, IDeferredWormhole)
 class _DeferredWormhole(object):
-    def __init__(self, eq):
+    def __init__(self, reactor, eq):
+        self._reactor = reactor
         self._welcome_observer = OneShotObserver(eq)
         self._code_observer = OneShotObserver(eq)
         self._key = None
         self._key_observer = OneShotObserver(eq)
         self._verifier_observer = OneShotObserver(eq)
+        self._wormhole_versions_and_sides_observer = OneShotObserver(eq)
         self._version_observer = OneShotObserver(eq)
         self._received_observer = SequenceObserver(eq)
         self._closed = False
@@ -136,6 +141,10 @@ class _DeferredWormhole(object):
     def get_versions(self):
         return self._version_observer.when_fired()
 
+    def _get_wormhole_versions_and_sides(self): # internal
+        # fires with (our_side, their_side, their_wormhole_versions)
+        return self._wormhole_versions_and_sides_observer.when_fired()
+
     def get_message(self):
         return self._received_observer.when_next_event()
 
@@ -162,6 +171,9 @@ class _DeferredWormhole(object):
         if not self._key: raise NoKeyError()
         return derive_key(self._key, to_bytes(purpose), length)
 
+    def dilate(self):
+        return self._boss.dilate() # fires with (endpoints)
+
     def close(self):
         # fails with WormholeError unless we established a connection
         # (state=="happy"). Fails with WrongPasswordError (a subclass of
@@ -187,6 +199,11 @@ class _DeferredWormhole(object):
 
     def got_verifier(self, verifier):
         self._verifier_observer.fire_if_not_fired(verifier)
+    def got_wormhole_versions(self, our_side, their_side,
+                              their_wormhole_versions):
+        # TODO: should we expose this API? or keep it internal for Dilation
+        result = (our_side, their_side, their_wormhole_versions)
+        self._wormhole_versions_and_sides_observer.fire_if_not_fired(result)
     def got_versions(self, versions):
         self._version_observer.fire_if_not_fired(versions)
 
@@ -227,8 +244,12 @@ def create(appid, relay_url, reactor, # use keyword args for everything else
     if delegate:
         w = _DelegatedWormhole(delegate)
     else:
-        w = _DeferredWormhole(eq)
-    wormhole_versions = {} # will be used to indicate Wormhole capabilities
+        w = _DeferredWormhole(reactor, eq)
+    # this indicates Wormhole capabilities
+    wormhole_versions = {
+        "can-dilate": [1],
+        "dilation-abilities": Connector.get_connection_abilities(),
+        }
     wormhole_versions["app_versions"] = versions # app-specific capabilities
     b = Boss(w, side, relay_url, appid, wormhole_versions,
              reactor, journal, tor, timing)

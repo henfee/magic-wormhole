@@ -20,6 +20,7 @@ from ._input import Input
 from ._code import Code, validate_code
 from ._terminator import Terminator
 from ._wordlist import PGPWordList
+from ._dilation.manager import Dilator
 from .errors import (ServerError, LonelyError, WrongPasswordError,
                      OnlyOneCodeError, _UnknownPhaseError, WelcomeError)
 from .util import bytes_to_dict
@@ -58,6 +59,7 @@ class Boss(object):
         self._I = Input(self._timing)
         self._C = Code(self._timing)
         self._T = Terminator()
+        self._D = Dilator()
 
         self._N.wire(self._M, self._I, self._RC, self._T)
         self._M.wire(self._N, self._RC, self._O, self._T)
@@ -71,12 +73,16 @@ class Boss(object):
         self._I.wire(self._C, self._L)
         self._C.wire(self, self._A, self._N, self._K, self._I)
         self._T.wire(self, self._RC, self._N, self._M)
+        self._D.wire(self._S)
 
     def _init_other_state(self):
         self._did_start_code = False
         self._next_tx_phase = 0
         self._next_rx_phase = 0
         self._rx_phases = {} # phase -> plaintext
+
+        self._next_rx_dilate_seqnum = 0
+        self._rx_dilate_seqnums = {} # seqnum -> plaintext
 
         self._result = "empty"
 
@@ -166,6 +172,9 @@ class Boss(object):
         self._did_start_code = True
         self._C.set_code(code)
 
+    def dilate(self):
+        return self._D.dilate() # fires with endpoints
+
     @m.input()
     def send(self, plaintext): pass
     @m.input()
@@ -209,11 +218,15 @@ class Boss(object):
     @m.input()
     def scared(self): pass
 
-    def got_message(self, phase, plaintext):
+    def got_message(self, side, phase, plaintext):
+        # this is only called for side != ours
         assert isinstance(phase, type("")), type(phase)
         assert isinstance(plaintext, type(b"")), type(plaintext)
+        d_mo = re.search(r'^dilate-\d+$', phase)
         if phase == "version":
-            self._got_version(plaintext)
+            self._got_version(side, plaintext)
+        elif d_mo:
+            self._got_dilate(int(d_mo.groups(1)), plaintext)
         elif re.search(r'^\d+$', phase):
             self._got_phase(int(phase), plaintext)
         else:
@@ -221,7 +234,9 @@ class Boss(object):
             # log.err so tests will catch surprises.
             log.err(_UnknownPhaseError("received unknown phase '%s'" % phase))
     @m.input()
-    def _got_version(self, plaintext): pass
+    def _got_version(self, side, plaintext): pass
+    @m.input()
+    def _got_dilate(self, seqnum, plaintext): pass
     @m.input()
     def _got_phase(self, phase, plaintext): pass
     @m.input()
@@ -237,10 +252,15 @@ class Boss(object):
     def do_got_code(self, code):
         self._W.got_code(code)
     @m.output()
-    def process_version(self, plaintext):
+    def process_version(self, side, plaintext):
         # most of this is wormhole-to-wormhole, ignored for now
         # in the future, this is how Dilation is signalled
+        self._their_side = side
         self._their_versions = bytes_to_dict(plaintext)
+        self._W.got_wormhole_versions(self._side, self._their_side,
+                                      self._their_versions)
+        self._D.got_wormhole_versions(self._side, self._their_side,
+                                      self._their_versions)
         # but this part is app-to-app
         app_versions = self._their_versions.get("app_versions", {})
         self._W.got_versions(app_versions)
@@ -290,6 +310,16 @@ class Boss(object):
             self._next_rx_phase += 1
 
     @m.output()
+    def D_received_dilate(self, seqnum, plaintext):
+        assert isinstance(seqnum, six.integer_types), type(seqnum)
+        # strict phase order, no gaps
+        self._rx_dilate_seqnum[seqnum] = plaintext
+        while self._next_rx_dilate_seqnum in self._rx_dilate_seqnums:
+            m = self._rx_dilate_seqnums.pop(self._next_rx_dilate_seqnum)
+            self._D.received_dilate(m)
+            self._next_rx_dilate_seqnum += 1
+
+    @m.output()
     def W_close_with_error(self, err):
         self._result = err # exception
         self._W.closed(self._result)
@@ -319,6 +349,7 @@ class Boss(object):
     S2_happy.upon(got_verifier, enter=S2_happy, outputs=[W_got_verifier])
     S2_happy.upon(_got_phase, enter=S2_happy, outputs=[W_received])
     S2_happy.upon(_got_version, enter=S2_happy, outputs=[process_version])
+    S2_happy.upon(_got_dilate, enter=S2_happy, outputs=[D_received_dilate])
     S2_happy.upon(scared, enter=S3_closing, outputs=[close_scared])
     S2_happy.upon(close, enter=S3_closing, outputs=[close_happy])
     S2_happy.upon(send, enter=S2_happy, outputs=[S_send])
@@ -330,6 +361,7 @@ class Boss(object):
     S3_closing.upon(got_verifier, enter=S3_closing, outputs=[])
     S3_closing.upon(_got_phase, enter=S3_closing, outputs=[])
     S3_closing.upon(_got_version, enter=S3_closing, outputs=[])
+    S3_closing.upon(_got_dilate, enter=S3_closing, outputs=[])
     S3_closing.upon(happy, enter=S3_closing, outputs=[])
     S3_closing.upon(scared, enter=S3_closing, outputs=[])
     S3_closing.upon(close, enter=S3_closing, outputs=[])
@@ -341,6 +373,7 @@ class Boss(object):
     S4_closed.upon(got_verifier, enter=S4_closed, outputs=[])
     S4_closed.upon(_got_phase, enter=S4_closed, outputs=[])
     S4_closed.upon(_got_version, enter=S4_closed, outputs=[])
+    S4_closed.upon(_got_dilate, enter=S4_closed, outputs=[])
     S4_closed.upon(happy, enter=S4_closed, outputs=[])
     S4_closed.upon(scared, enter=S4_closed, outputs=[])
     S4_closed.upon(close, enter=S4_closed, outputs=[])

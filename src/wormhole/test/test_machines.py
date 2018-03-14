@@ -8,7 +8,8 @@ from .. import (errors, timing, _order, _receive, _key, _code, _lister, _boss,
                 _rendezvous)
 from .._interfaces import (IKey, IReceive, IBoss, ISend, IMailbox, IOrder,
                            IRendezvousConnector, ILister, IInput, IAllocator,
-                           INameplate, ICode, IWordlist, ITerminator)
+                           INameplate, ICode, IWordlist, ITerminator,
+                           IDilator)
 from .._key import derive_key, derive_phase_key, encrypt_data
 from ..journal import ImmediateJournal
 from ..util import (dict_to_bytes, bytes_to_dict,
@@ -149,7 +150,7 @@ class Receive(unittest.TestCase):
         self.assertEqual(events, [("s.got_verified_key", key),
                                   ("b.happy",),
                                   ("b.got_verifier", verifier),
-                                  ("b.got_message", u"phase1", data1),
+                                  ("b.got_message", u"side", u"phase1", data1),
                                   ])
 
         phase2_key = derive_phase_key(key, u"side", u"phase2")
@@ -159,8 +160,8 @@ class Receive(unittest.TestCase):
         self.assertEqual(events, [("s.got_verified_key", key),
                                   ("b.happy",),
                                   ("b.got_verifier", verifier),
-                                  ("b.got_message", u"phase1", data1),
-                                  ("b.got_message", u"phase2", data2),
+                                  ("b.got_message", u"side", u"phase1", data1),
+                                  ("b.got_message", u"side", u"phase2", data2),
                                   ])
 
     def test_early_bad(self):
@@ -195,7 +196,7 @@ class Receive(unittest.TestCase):
         self.assertEqual(events, [("s.got_verified_key", key),
                                   ("b.happy",),
                                   ("b.got_verifier", verifier),
-                                  ("b.got_message", u"phase1", data1),
+                                  ("b.got_message", u"side", u"phase1", data1),
                                   ])
 
         phase2_key = derive_phase_key(key, u"side", u"bad")
@@ -205,7 +206,7 @@ class Receive(unittest.TestCase):
         self.assertEqual(events, [("s.got_verified_key", key),
                                   ("b.happy",),
                                   ("b.got_verifier", verifier),
-                                  ("b.got_message", u"phase1", data1),
+                                  ("b.got_message", u"side", u"phase1", data1),
                                   ("b.scared",),
                                   ])
         r.got_message(u"side", u"phase1", good_body)
@@ -213,7 +214,7 @@ class Receive(unittest.TestCase):
         self.assertEqual(events, [("s.got_verified_key", key),
                                   ("b.happy",),
                                   ("b.got_verifier", verifier),
-                                  ("b.got_message", u"phase1", data1),
+                                  ("b.got_message", u"side", u"phase1", data1),
                                   ("b.scared",),
                                   ])
 
@@ -1214,6 +1215,7 @@ class Boss(unittest.TestCase):
         wormhole = Dummy("w", events, None,
                          "got_welcome",
                          "got_code", "got_key", "got_verifier", "got_versions",
+                         "got_wormhole_versions",
                          "received", "closed")
         versions = {"app": "version1"}
         reactor = None
@@ -1227,6 +1229,7 @@ class Boss(unittest.TestCase):
         b._RC = Dummy("rc", events, IRendezvousConnector, "start")
         b._C = Dummy("c", events, ICode,
                      "allocate_code", "input_code", "set_code")
+        b._D = Dummy("d", events, IDilator, "got_wormhole_versions")
         return b, events
 
     def test_basic(self):
@@ -1249,10 +1252,12 @@ class Boss(unittest.TestCase):
         b.got_key(b"key")
         b.happy()
         b.got_verifier(b"verifier")
-        b.got_message("version", b"{}")
-        b.got_message("0", b"msg1")
+        b.got_message("side", "version", b"{}")
+        b.got_message("side", "0", b"msg1")
         self.assertEqual(events, [("w.got_key", b"key"),
                                   ("w.got_verifier", b"verifier"),
+                                  ("w.got_wormhole_versions", "side", "side", {}),
+                                  ("d.got_wormhole_versions", "side", "side", {}),
                                   ("w.got_versions", {}),
                                   ("w.received", b"msg1"),
                                   ])
@@ -1405,7 +1410,7 @@ class Boss(unittest.TestCase):
 
         b.happy() # phase=version
 
-        b.got_message("unknown-phase", b"spooky")
+        b.got_message("side", "unknown-phase", b"spooky")
         self.assertEqual(events, [])
 
         self.flushLoggedErrors(errors._UnknownPhaseError)

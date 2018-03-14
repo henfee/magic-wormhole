@@ -42,9 +42,9 @@ class Receive(object):
         except CryptoError:
             self.got_message_bad()
             return
-        self.got_message_good(phase, plaintext)
+        self.got_message_good(side, phase, plaintext)
     @m.input()
-    def got_message_good(self, phase, plaintext): pass
+    def got_message_good(self, side, phase, plaintext): pass
     @m.input()
     def got_message_bad(self): pass
 
@@ -56,20 +56,20 @@ class Receive(object):
     def record_key(self, key):
         self._key = key
     @m.output()
-    def S_got_verified_key(self, phase, plaintext):
+    def S_got_verified_key(self, side, phase, plaintext):
         assert self._key
         self._S.got_verified_key(self._key)
     @m.output()
-    def W_happy(self, phase, plaintext):
+    def W_happy(self, side, phase, plaintext):
         self._B.happy()
     @m.output()
-    def W_got_verifier(self, phase, plaintext):
+    def W_got_verifier(self, side, phase, plaintext):
         self._B.got_verifier(derive_key(self._key, b"wormhole:verifier"))
     @m.output()
-    def W_got_message(self, phase, plaintext):
+    def W_got_message(self, side, phase, plaintext):
         assert isinstance(phase, type("")), type(phase)
         assert isinstance(plaintext, type(b"")), type(plaintext)
-        self._B.got_message(phase, plaintext)
+        self._B.got_message(side, phase, plaintext)
     @m.output()
     def W_scared(self):
         self._B.scared()
