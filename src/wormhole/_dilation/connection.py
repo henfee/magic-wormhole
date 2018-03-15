@@ -240,8 +240,8 @@ def parse_record(plaintext):
     if msgtype == T_ACK:
         resp_seqnum = plaintext[1:5]
         return Ack(resp_seqnum)
-    log.err("received unknown message type {}".format(plaintext))
-    # TODO: raise
+    log.err("received unknown message type: {}".format(plaintext))
+    raise ValueError()
 
 @attrs
 class _Record(object):

@@ -369,3 +369,28 @@ class Framer(unittest.TestCase):
         self.assertEqual([], list(f.add_and_parse(encoded_frame[2:6])))
         self.assertEqual([Frame(frame=b"frame")],
                          list(f.add_and_parse(encoded_frame[6:])))
+
+from .._dilation.connection import (parse_record,
+                                    KCM, Ping, Pong, Open, Data, Close, Ack)
+class Parse(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(parse_record(b"\x00"), KCM())
+        self.assertEqual(parse_record(b"\x01\x55\x44\x33\x22"),
+                         Ping(ping_id=b"\x55\x44\x33\x22"))
+        self.assertEqual(parse_record(b"\x02\x55\x44\x33\x22"),
+                         Pong(ping_id=b"\x55\x44\x33\x22"))
+        self.assertEqual(parse_record(b"\x03scidseqn"),
+                         Open(scid=b"scid", seqnum=b"seqn"))
+        self.assertEqual(parse_record(b"\x04scidseqndataaa"),
+                         Data(scid=b"scid", seqnum=b"seqn", data=b"dataaa"))
+        self.assertEqual(parse_record(b"\x05scidseqn"),
+                         Close(scid=b"scid", seqnum=b"seqn"))
+        self.assertEqual(parse_record(b"\x06seqn"),
+                         Ack(resp_seqnum=b"seqn"))
+        with mock.patch("wormhole._dilation.connection.log.err") as m:
+            with self.assertRaises(ValueError):
+                parse_record(b"\x07unknown")
+        self.assertEqual(m.mock_calls,
+                         [mock.call("received unknown message type: " +
+                                    repr(b"\x07unknown"))])
+
