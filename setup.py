@@ -33,6 +33,7 @@ setup(name="magic-wormhole",
           "tqdm >= 4.13.0", # 4.13.0 fixes crash on NetBSD
           "click",
           "humanize",
+          "noiseprotocol",
           "txtorcon >= 0.19.3",
       ],
       extras_require={
