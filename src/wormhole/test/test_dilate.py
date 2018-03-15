@@ -233,16 +233,35 @@ class Endpoints(unittest.TestCase):
         m = mock_manager()
         m.allocate_subchannel_id = mock.Mock(return_value=b"scid")
         hostaddr = _WormholeAddress(mock_wormhole())
-        #peeraddr = _SubchannelAddress(b"scid")
         ep = SubchannelListenerEndpoint(m, hostaddr)
 
         f = mock.Mock()
-        p = mock.Mock()
-        f.buildProtocol = mock.Mock(return_value=p)
+        p1 = mock.Mock()
+        p2 = mock.Mock()
+        f.buildProtocol = mock.Mock(side_effect=[p1, p2])
+
+        # OPEN that arrives before we ep.listen() should be queued
+
+        t1 = mock.Mock()
+        peeraddr1 = _SubchannelAddress(b"peer1")
+        ep._got_open(t1, peeraddr1)
+
         d = ep.listen(f)
         lp = self.successResultOf(d)
         self.assertIsInstance(lp, SubchannelListeningPort)
 
-        #with mock.patch("wormhole._dilation.subchannel.SubChannel",
-        #                return_value=t) as sc:
-        #    pass
+        self.assertEqual(lp.getHost(), hostaddr)
+        lp.startListening()
+
+        self.assertEqual(t1.mock_calls, [mock.call._set_protocol(p1)])
+        self.assertEqual(p1.mock_calls, [mock.call.makeConnection(t1)])
+
+        t2 = mock.Mock()
+        peeraddr2 = _SubchannelAddress(b"peer2")
+        ep._got_open(t2, peeraddr2)
+
+        self.assertEqual(t2.mock_calls, [mock.call._set_protocol(p2)])
+        self.assertEqual(p2.mock_calls, [mock.call.makeConnection(t2)])
+
+        lp.stopListening() # TODO: should this do more?
+

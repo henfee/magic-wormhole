@@ -64,7 +64,7 @@ class SubChannel(object):
     _peer_addr = attrib(validator=instance_of(_SubchannelAddress))
 
     m = MethodicalMachine()
-    set_trace = getattr(m, "_setTrace", lambda self, f: None)
+    set_trace = getattr(m, "_setTrace", lambda self, f: None) # pragma: no cover
 
     def __attrs_post_init__(self):
         #self._mailbox = None
