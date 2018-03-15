@@ -291,7 +291,8 @@ class Framer(unittest.TestCase):
             with self.assertRaises(Disconnect):
                 list(f.add_and_parse(b"not the prologue after all"))
         self.assertEqual(m.mock_calls,
-                         [mock.call("bad prologue: b'inbound_not the p'")])
+                         [mock.call("bad prologue: {}".format(
+                             b"inbound_not the p"))])
         self.assertEqual(t.mock_calls, [])
 
     def test_bad_prologue_newline(self):
@@ -307,7 +308,9 @@ class Framer(unittest.TestCase):
         with mock.patch("wormhole._dilation.connection.log.msg") as m:
             with self.assertRaises(Disconnect):
                 list(f.add_and_parse(b"\n"))
-        self.assertEqual(m.mock_calls, [mock.call("bad prologue: b'inbound_not\\n'")])
+        self.assertEqual(m.mock_calls,
+                         [mock.call("bad prologue: {}".format(
+                             b"inbound_not\n"))])
         self.assertEqual(t.mock_calls, [])
 
     def test_good_prologue(self):
@@ -337,7 +340,8 @@ class Framer(unittest.TestCase):
         with mock.patch("wormhole._dilation.connection.log.msg") as m:
             with self.assertRaises(Disconnect):
                 list(f.add_and_parse(b"goodbye\n"))
-        self.assertEqual(m.mock_calls, [mock.call("bad relay_ok: b'goo'")])
+        self.assertEqual(m.mock_calls,
+                         [mock.call("bad relay_ok: {}".format(b"goo"))])
         self.assertEqual(t.mock_calls, [])
 
     def test_good_relay(self):
@@ -391,6 +395,6 @@ class Parse(unittest.TestCase):
             with self.assertRaises(ValueError):
                 parse_record(b"\x07unknown")
         self.assertEqual(m.mock_calls,
-                         [mock.call("received unknown message type: " +
-                                    repr(b"\x07unknown"))])
+                         [mock.call("received unknown message type: {}".format(
+                             b"\x07unknown"))])
 
