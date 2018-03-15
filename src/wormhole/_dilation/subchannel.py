@@ -1,7 +1,7 @@
 from attr import attrs, attrib
 from attr.validators import instance_of, provides
 from zope.interface import implementer
-from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
+from twisted.internet.defer import Deferred, inlineCallbacks, returnValue, succeed
 from twisted.internet.interfaces import (ITransport, IProducer, IConsumer,
                                          IAddress, IListeningPort,
                                          IStreamClientEndpoint,
@@ -47,8 +47,9 @@ class _WormholeAddress(object):
     _wormhole = attrib(validator=provides(IWormhole))
 
 @implementer(IAddress)
+@attrs
 class _SubchannelAddress(object):
-    pass
+    _scid = attrib()
 
 
 @attrs
@@ -57,7 +58,7 @@ class _SubchannelAddress(object):
 @implementer(IConsumer)
 @implementer(ISubChannel)
 class SubChannel(object):
-    _id = attrib(validator=int)
+    _id = attrib(validator=instance_of(bytes))
     _manager = attrib(validator=provides(IDilationManager))
     _host_addr = attrib(validator=instance_of(_WormholeAddress))
     _peer_addr = attrib(validator=instance_of(_SubchannelAddress))
@@ -147,7 +148,7 @@ class SubChannel(object):
             for data in self._pending_dataReceived:
                 self._protocol.dataReceived(data)
             self._pending_dataReceived =  []
-        cl, what = self._pending_connectionLost[0]
+        cl, what = self._pending_connectionLost
         if cl:
             self._protocol.connectionLost(what)
 
@@ -212,7 +213,6 @@ class SubchannelConnectorEndpoint(object):
     _manager = attrib(validator=provides(IDilationManager))
     _host_addr = attrib(validator=instance_of(_WormholeAddress))
 
-    @inlineCallbacks
     def connect(self, protocolFactory):
         # return Deferred that fires with IProtocol or Failure(ConnectError)
         scid = self._manager.allocate_subchannel_id()
@@ -224,7 +224,7 @@ class SubchannelConnectorEndpoint(object):
         p = protocolFactory.buildProtocol(peer_addr)
         t._set_protocol(p)
         p.makeConnection(t) # set p.transport = t and call connectionMade()
-        returnValue(p)
+        return succeed(p)
 
 @implementer(IStreamServerEndpoint)
 @attrs
@@ -250,14 +250,13 @@ class SubchannelListenerEndpoint(object):
 
     # IStreamServerEndpoint
 
-    @inlineCallbacks
     def listen(self, protocolFactory):
         self._factory = protocolFactory
         for (t, peer_addr) in self._pending_opens:
             self._connect(t, peer_addr)
         self._pending_opens = []
         lp = SubchannelListeningPort(self._host_addr)
-        returnValue(lp)
+        return succeed(lp)
 
 @implementer(IListeningPort)
 @attrs

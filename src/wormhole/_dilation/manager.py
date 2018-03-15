@@ -559,12 +559,19 @@ class Dilator(object):
         else:
             self._manager = ManagerFollower(self._eventual_queue)
 
+        # we could probably return the endpoints earlier
         yield self._manager.when_first_connected()
+        # we can open subchannels as soon as we get our first connection
         peer_addr = _SubchannelAddress()
         control_ep = ControlEndpoint(peer_addr)
-        # TODO glue: call control_ep._subchannel_zero_opened(sc)
+        scid0 = b"\x00\x00\x00\x00"
+        sc0 = SubChannel(scid0, self._manager, self._host_addr, peer_addr)
+        control_ep._subchannel_zero_opened(sc0)
+
         connect_ep = SubchannelConnectorEndpoint(self)
+
         listen_ep = SubchannelListenerEndpoint(self, self._host_addr)
+
         endpoints = (control_ep, connect_ep, listen_ep)
         returnValue(endpoints)
 
