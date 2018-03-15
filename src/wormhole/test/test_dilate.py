@@ -489,7 +489,7 @@ class Record(unittest.TestCase):
         n.mock_calls[:] = []
 
         with mock.patch("wormhole._dilation.connection.log.err") as le:
-            with self.assertRaises(Disconnect) as e:
+            with self.assertRaises(Disconnect):
                 list(r.dataReceived(b"data"))
         self.assertEqual(le.mock_calls,
                          [mock.call(nvm, "bad inbound noise handshake")])
@@ -513,7 +513,7 @@ class Record(unittest.TestCase):
         n.mock_calls[:] = []
 
         with mock.patch("wormhole._dilation.connection.log.err") as le:
-            with self.assertRaises(Disconnect) as e:
+            with self.assertRaises(Disconnect):
                 list(r.dataReceived(b"data"))
         self.assertEqual(le.mock_calls,
                          [mock.call(nvm, "bad inbound noise frame")])
