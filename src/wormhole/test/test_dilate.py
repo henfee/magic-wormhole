@@ -265,8 +265,8 @@ class Endpoints(unittest.TestCase):
 
         lp.stopListening() # TODO: should this do more?
 
-from .._dilation.connection import (_Framer, Frame, Prologue,
-                                    #_Record,
+from .._dilation.connection import (IFramer, _Framer, Frame, Prologue,
+                                    _Record, Handshake,
                                     #DilatedConnectionProtocol,
                                     Disconnect)
 
@@ -374,7 +374,7 @@ class Framer(unittest.TestCase):
         self.assertEqual([Frame(frame=b"frame")],
                          list(f.add_and_parse(encoded_frame[6:])))
 
-from .._dilation.connection import (parse_record,
+from .._dilation.connection import (parse_record, encode_record,
                                     KCM, Ping, Pong, Open, Data, Close, Ack)
 class Parse(unittest.TestCase):
     def test_parse(self):
@@ -391,10 +391,147 @@ class Parse(unittest.TestCase):
                          Close(scid=b"scid", seqnum=b"seqn"))
         self.assertEqual(parse_record(b"\x06seqn"),
                          Ack(resp_seqnum=b"seqn"))
-        with mock.patch("wormhole._dilation.connection.log.err") as m:
+        with mock.patch("wormhole._dilation.connection.log.err") as le:
             with self.assertRaises(ValueError):
                 parse_record(b"\x07unknown")
-        self.assertEqual(m.mock_calls,
+        self.assertEqual(le.mock_calls,
                          [mock.call("received unknown message type: {}".format(
                              b"\x07unknown"))])
 
+    def test_encode(self):
+        self.assertEqual(encode_record(KCM()), b"\x00")
+        self.assertEqual(encode_record(Ping(ping_id=b"ping")), b"\x01ping")
+        self.assertEqual(encode_record(Pong(ping_id=b"pong")), b"\x02pong")
+        self.assertEqual(encode_record(Open(scid=b"scid", seqnum=b"seqn")),
+                         b"\x03scidseqn")
+        self.assertEqual(encode_record(Data(scid=b"scid", seqnum=b"seqn",
+                                            data=b"dataaa")),
+                         b"\x04scidseqndataaa")
+        self.assertEqual(encode_record(Close(scid=b"scid", seqnum=b"seqn")),
+                         b"\x05scidseqn")
+        self.assertEqual(encode_record(Ack(resp_seqnum=b"seqn")),
+                         b"\x06seqn")
+        with self.assertRaises(TypeError) as ar:
+            encode_record("not a record")
+        self.assertEqual(str(ar.exception), "not a record")
+
+from noise.exceptions import NoiseInvalidMessage
+
+class Record(unittest.TestCase):
+    def test_dataReceived(self):
+        f = mock.Mock()
+        alsoProvides(f, IFramer)
+        f.add_and_parse = mock.Mock(side_effect=[
+            [],
+            [Prologue()],
+            [Frame(frame=b"rx-handshake")],
+            [Frame(frame=b"frame1"), Frame(frame=b"frame2")],
+            ])
+        n = mock.Mock()
+        n.write_message = mock.Mock(return_value=b"tx-handshake")
+        p1, p2 = object(), object()
+        n.decrypt = mock.Mock(side_effect=[p1, p2])
+        r = _Record(f, n)
+        self.assertEqual(f.mock_calls, [])
+        r.connectionMade()
+        self.assertEqual(f.mock_calls, [mock.call.connectionMade()])
+        f.mock_calls[:] = []
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        n.mock_calls[:] = []
+
+        # Pretend to deliver the prologue in two parts. The text we send in
+        # doesn't matter: the side_effect= is what causes the prologue to be
+        # recognized by the second call.
+        self.assertEqual(list(r.dataReceived(b"pro")), [])
+        self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"pro")])
+        f.mock_calls[:] = []
+        self.assertEqual(n.mock_calls, [])
+
+        # recognizing the prologue causes a handshake frame to be sent
+        self.assertEqual(list(r.dataReceived(b"logue")), [])
+        self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"logue"),
+                                        mock.call.send_frame(b"tx-handshake")])
+        f.mock_calls[:] = []
+        self.assertEqual(n.mock_calls, [mock.call.write_message()])
+        n.mock_calls[:] = []
+
+        # next dataReceived is recognized as the Handshake
+        self.assertEqual(list(r.dataReceived(b"blah")), [Handshake()])
+        self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"blah")])
+        f.mock_calls[:] = []
+        self.assertEqual(n.mock_calls, [mock.call.read_message(b"rx-handshake")])
+        n.mock_calls[:] = []
+
+        # next is a pair of Records
+        r1, r2 = object() , object()
+        with mock.patch("wormhole._dilation.connection.parse_record",
+                        side_effect=[r1,r2]) as pr:
+            self.assertEqual(list(r.dataReceived(b"blah2")), [r1, r2])
+            self.assertEqual(n.mock_calls, [mock.call.decrypt(b"frame1"),
+                                            mock.call.decrypt(b"frame2")])
+            self.assertEqual(pr.mock_calls, [mock.call(p1), mock.call(p2)])
+
+    def test_bad_handshake(self):
+        f = mock.Mock()
+        alsoProvides(f, IFramer)
+        f.add_and_parse = mock.Mock(return_value=[Prologue(),
+                                                  Frame(frame=b"rx-handshake")])
+        n = mock.Mock()
+        n.write_message = mock.Mock(return_value=b"tx-handshake")
+        nvm = NoiseInvalidMessage()
+        n.read_message = mock.Mock(side_effect=nvm)
+        r = _Record(f, n)
+        self.assertEqual(f.mock_calls, [])
+        r.connectionMade()
+        self.assertEqual(f.mock_calls, [mock.call.connectionMade()])
+        f.mock_calls[:] = []
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        n.mock_calls[:] = []
+
+        with mock.patch("wormhole._dilation.connection.log.err") as le:
+            with self.assertRaises(Disconnect) as e:
+                list(r.dataReceived(b"data"))
+        self.assertEqual(le.mock_calls,
+                         [mock.call(nvm, "bad inbound noise handshake")])
+
+    def test_bad_message(self):
+        f = mock.Mock()
+        alsoProvides(f, IFramer)
+        f.add_and_parse = mock.Mock(return_value=[Prologue(),
+                                                  Frame(frame=b"rx-handshake"),
+                                                  Frame(frame=b"bad-message")])
+        n = mock.Mock()
+        n.write_message = mock.Mock(return_value=b"tx-handshake")
+        nvm = NoiseInvalidMessage()
+        n.decrypt = mock.Mock(side_effect=nvm)
+        r = _Record(f, n)
+        self.assertEqual(f.mock_calls, [])
+        r.connectionMade()
+        self.assertEqual(f.mock_calls, [mock.call.connectionMade()])
+        f.mock_calls[:] = []
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        n.mock_calls[:] = []
+
+        with mock.patch("wormhole._dilation.connection.log.err") as le:
+            with self.assertRaises(Disconnect) as e:
+                list(r.dataReceived(b"data"))
+        self.assertEqual(le.mock_calls,
+                         [mock.call(nvm, "bad inbound noise frame")])
+
+    def test_send_record(self):
+        f = mock.Mock()
+        alsoProvides(f, IFramer)
+        n = mock.Mock()
+        f1 = object()
+        n.send = mock.Mock(return_value=f1)
+        r1 = Ping(b"pingid")
+        r = _Record(f, n)
+        self.assertEqual(f.mock_calls, [])
+        m1 = object()
+        with mock.patch("wormhole._dilation.connection.encode_record",
+                        return_value=m1) as er:
+            r.send_record(r1)
+        self.assertEqual(er.mock_calls, [mock.call(r1)])
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake(),
+                                        mock.call.send(m1)])
+        self.assertEqual(f.mock_calls, [mock.call.send_frame(f1)])

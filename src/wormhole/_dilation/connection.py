@@ -3,6 +3,7 @@ from collections import namedtuple
 from attr import attrs, attrib
 from attr.validators import optional, instance_of, provides
 from automat import MethodicalMachine
+from zope.interface import Interface, implementer
 from twisted.python import log
 from twisted.internet.protocol import Protocol
 from twisted.internet.interfaces import ITransport
@@ -46,7 +47,11 @@ RelayOK = namedtuple("RelayOk", [])
 Prologue = namedtuple("Prologue", [])
 Frame = namedtuple("Frame", ["frame"])
 
+class IFramer(Interface):
+    pass
+
 @attrs
+@implementer(IFramer)
 class _Framer(object):
     _transport = attrib(validator=provides(ITransport))
     _outbound_prologue = attrib(validator=instance_of(bytes))
@@ -243,9 +248,26 @@ def parse_record(plaintext):
     log.err("received unknown message type: {}".format(plaintext))
     raise ValueError()
 
+def encode_record(r):
+    if isinstance(r, KCM):
+        return b"\x00"
+    if isinstance(r, Ping):
+        return b"\x01" + r.ping_id
+    if isinstance(r, Pong):
+        return b"\x02" + r.ping_id
+    if isinstance(r, Open):
+        return b"\x03" + r.scid + r.seqnum
+    if isinstance(r, Data):
+        return b"\x04" + r.scid + r.seqnum + r.data
+    if isinstance(r, Close):
+        return b"\x05" + r.scid + r.seqnum
+    if isinstance(r, Ack):
+        return b"\x06" + r.resp_seqnum
+    raise TypeError(r)
+
 @attrs
 class _Record(object):
-    _framer = attrib(validator=instance_of(_Framer))
+    _framer = attrib(validator=provides(IFramer))
     _noise = attrib()
 
     n = MethodicalMachine()
@@ -313,10 +335,10 @@ class _Record(object):
     # external API is: connectionMade, dataReceived, send_record
 
     def connectionMade(self):
-        self._f.connectionMade()
+        self._framer.connectionMade()
 
     def dataReceived(self, data):
-        for token in self._f.add_and_parse(data):
+        for token in self._framer.add_and_parse(data):
             if isinstance(token, Prologue):
                 self.got_prologue() # triggers send_handshake
             else:
@@ -327,23 +349,6 @@ class _Record(object):
         message = encode_record(r)
         frame = self._noise.send(message)
         self._framer.send_frame(frame)
-
-def encode_record(r):
-    if isinstance(r, KCM):
-        return b"\x00"
-    if isinstance(r, Ping):
-        return b"\x01" + r.ping_id
-    if isinstance(r, Pong):
-        return b"\x02" + r.ping_id
-    if isinstance(r, Open):
-        return b"\x03" + r.scid + r.seqnum
-    if isinstance(r, Data):
-        return b"\x04" + r.scid + r.seqnum + r.data
-    if isinstance(r, Close):
-        return b"\x05" + r.scid + r.seqnum
-    if isinstance(r, Ack):
-        return b"\x06" + r.resp_seqnum
-    raise TypeError(r)
 
 
 @attrs
