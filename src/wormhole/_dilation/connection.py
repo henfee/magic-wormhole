@@ -61,7 +61,7 @@ class _Framer(object):
     # out (shared): transport.write (relay handshake, prologue)
     # states: want_relay, want_prologue, want_frame
     m = MethodicalMachine()
-    set_trace = getattr(m, "_setTrace", lambda self, f: None)
+    set_trace = getattr(m, "_setTrace", lambda self, f: None) # pragma: no cover
 
     @m.state()
     def want_relay(self): pass # pragma: no cover
@@ -112,7 +112,7 @@ class _Framer(object):
         if len(self._buffer) < 4:
             return None
         frame_length = from_be4(self._buffer[0:4])
-        if len(self._buffer) < frame_length:
+        if len(self._buffer) < 4+frame_length:
             return None
         frame = self._buffer[4:4+frame_length]
         self._buffer = self._buffer[4+frame_length:] # TODO: avoid copy
@@ -140,18 +140,18 @@ class _Framer(object):
     def _get_expected(self, name, expected):
         lb = len(self._buffer)
         le = len(expected)
-        # if the buffer starts with the expected string, consume it and return
-        # True
         if self._buffer.startswith(expected):
+            # if the buffer starts with the expected string, consume it and
+            # return True
             self._buffer = self._buffer[le:]
             return True
-        # the data we've received so far does not match the expected value, so
-        # this can't possibly be right. Don't complain until we see the
-        # expected length, or a newline, so we can capture the weird input in
-        # the log for debugging.
-        if self._buffer != expected[:lb]:
+        if not expected.startswith(self._buffer):
+            # we're not on track: the data we've received so far does not
+            # match the expected value, so this can't possibly be right.
+            # Don't complain until we see the expected length, or a newline,
+            # so we can capture the weird input in the log for debugging.
             if (b"\n" in self._buffer or lb >= le):
-                log.msg("bad {} {}".format(name, self._buffer[:le]))
+                log.msg("bad {}: {}".format(name, self._buffer[:le]))
                 raise Disconnect()
             return False # wait a bit longer
         # good so far, just waiting for the rest
@@ -179,7 +179,7 @@ class _Framer(object):
             else:
                 break
 
-    def send_frame(self, send, frame):
+    def send_frame(self, frame):
         assert self._can_send_frames
         self._transport.write(to_be4(len(frame)) + frame)
 
