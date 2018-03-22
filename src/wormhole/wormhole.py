@@ -93,8 +93,6 @@ class _DelegatedWormhole(object):
         self._key = key # for derive_key()
     def got_verifier(self, verifier):
         self._delegate.wormhole_got_verifier(verifier)
-    def got_wormhole_versions(self, our_side, their_side, wormhole_versions):
-        pass # internal, not delegated
     def got_versions(self, versions):
         self._delegate.wormhole_got_versions(versions)
     def received(self, plaintext):
@@ -111,7 +109,6 @@ class _DeferredWormhole(object):
         self._key = None
         self._key_observer = OneShotObserver(eq)
         self._verifier_observer = OneShotObserver(eq)
-        self._wormhole_versions_and_sides_observer = OneShotObserver(eq)
         self._version_observer = OneShotObserver(eq)
         self._received_observer = SequenceObserver(eq)
         self._closed = False
@@ -140,10 +137,6 @@ class _DeferredWormhole(object):
 
     def get_versions(self):
         return self._version_observer.when_fired()
-
-    def _get_wormhole_versions_and_sides(self): # internal
-        # fires with (our_side, their_side, their_wormhole_versions)
-        return self._wormhole_versions_and_sides_observer.when_fired()
 
     def get_message(self):
         return self._received_observer.when_next_event()
@@ -199,11 +192,6 @@ class _DeferredWormhole(object):
 
     def got_verifier(self, verifier):
         self._verifier_observer.fire_if_not_fired(verifier)
-    def got_wormhole_versions(self, our_side, their_side,
-                              their_wormhole_versions):
-        # TODO: should we expose this API? or keep it internal for Dilation
-        result = (our_side, their_side, their_wormhole_versions)
-        self._wormhole_versions_and_sides_observer.fire_if_not_fired(result)
     def got_versions(self, versions):
         self._version_observer.fire_if_not_fired(versions)
 
