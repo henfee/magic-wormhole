@@ -2,9 +2,13 @@ from __future__ import print_function, unicode_literals
 import mock
 from zope.interface import alsoProvides
 from twisted.trial import unittest
+from twisted.internet.task import Clock
 from twisted.internet.interfaces import ITransport
 from twisted.internet.error import ConnectionDone
-from wormhole._interfaces import IDilationManager, IWormhole, ISubChannel
+from ..eventual import EventualQueue
+from wormhole._interfaces import (IDilationManager, IDilationConnector,
+                                  IWormhole, ISubChannel)
+from wormhole._dilation.roles import LEADER, FOLLOWER
 from wormhole._dilation.encode import to_be4, from_be4
 from wormhole._dilation.subchannel import (Once, SubChannel,
                                            ControlEndpoint,
@@ -17,7 +21,7 @@ from wormhole._dilation.subchannel import (Once, SubChannel,
 
 from .._dilation.connection import (IFramer, _Framer, Frame, Prologue,
                                     _Record, Handshake,
-                                    #DilatedConnectionProtocol,
+                                    DilatedConnectionProtocol,
                                     Disconnect)
 from .._dilation.connection import (parse_record, encode_record,
                                     KCM, Ping, Pong, Open, Data, Close, Ack)
@@ -676,3 +680,214 @@ class Record(unittest.TestCase):
             self.assertEqual(pr.mock_calls, [mock.call(kcm), mock.call(msg1)])
         n.mock_calls[:] = []
         f.mock_calls[:] = []
+
+def make_con(role, use_relay=False):
+    clock = Clock()
+    eq = EventualQueue(clock)
+    connector = mock.Mock()
+    alsoProvides(connector, IDilationConnector)
+    n = mock.Mock() # pretends to be a Noise object
+    n.write_message = mock.Mock(side_effect=[b"handshake"])
+    c = DilatedConnectionProtocol(eq, role, connector, n,
+                                  b"outbound_prologue\n", b"inbound_prologue\n")
+    if use_relay:
+        c.use_relay(b"relay_handshake\n")
+    t = mock.Mock()
+    alsoProvides(t, ITransport)
+    return c, n, connector, t, eq
+
+def clear_mock_calls(n, connector, t, m=None):
+    n.mock_calls[:] = []
+    connector.mock_calls[:] = []
+    t.mock_calls[:] = []
+    if m:
+        m.mock_calls[:] = []
+
+class Connection(unittest.TestCase):
+    def test_bad_prologue(self):
+        c, n, connector, t, eq = make_con(LEADER)
+        c.makeConnection(t)
+        d = c.when_disconnected()
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.write(b"outbound_prologue\n")])
+        clear_mock_calls(n, connector, t)
+
+        c.dataReceived(b"prologue\n")
+        self.assertEqual(n.mock_calls, [])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.loseConnection()])
+
+        eq.flush_sync()
+        self.assertNoResult(d)
+        c.connectionLost(b"why")
+        eq.flush_sync()
+        self.assertIdentical(self.successResultOf(d), c)
+
+    def _test_no_relay(self, role):
+        c, n, connector, t, eq = make_con(role)
+        t_kcm = KCM()
+        t_open = Open(seqnum=b"\x00\x01\x02\x03", scid=b"\x11\x22\x33\x44")
+        t_ack = Ack(resp_seqnum=b"\x55\x66\x77\x88")
+        n.decrypt = mock.Mock(side_effect=[
+            encode_record(t_kcm),
+            encode_record(t_open),
+            ])
+        exp_kcm = b"\x00\x00\x00\x03kcm"
+        n.encrypt = mock.Mock(side_effect=[b"kcm", b"ack1"])
+        m = mock.Mock() # Manager
+
+        c.makeConnection(t)
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.write(b"outbound_prologue\n")])
+        clear_mock_calls(n, connector, t, m)
+
+        c.dataReceived(b"inbound_prologue\n")
+        self.assertEqual(n.mock_calls, [mock.call.write_message()])
+        self.assertEqual(connector.mock_calls, [])
+        exp_handshake = b"\x00\x00\x00\x09handshake"
+        self.assertEqual(t.mock_calls, [mock.call.write(exp_handshake)])
+        clear_mock_calls(n, connector, t, m)
+
+        c.dataReceived(b"\x00\x00\x00\x0Ahandshake2")
+        if role is LEADER:
+            # we're the leader, so we don't send the KCM right away
+            self.assertEqual(n.mock_calls, [
+                mock.call.read_message(b"handshake2")])
+            self.assertEqual(connector.mock_calls, [])
+            self.assertEqual(t.mock_calls, [])
+            self.assertEqual(c._manager, None)
+        else:
+            # we're the follower, so we encrypt and send the KCM immediately
+            self.assertEqual(n.mock_calls, [
+                mock.call.read_message(b"handshake2"),
+                mock.call.encrypt(encode_record(t_kcm)),
+                ])
+            self.assertEqual(connector.mock_calls, [])
+            self.assertEqual(t.mock_calls, [
+                mock.call.write(exp_kcm)])
+            self.assertEqual(c._manager, None)
+        clear_mock_calls(n, connector, t, m)
+
+        c.dataReceived(b"\x00\x00\x00\x03KCM")
+        # leader: inbound KCM means we add the candidate
+        # follower: inbound KCM means we've been selected.
+        # in both cases we notify Connector.add_candidate(), and the Connector
+        # decides if/when to call .select()
+
+        self.assertEqual(n.mock_calls, [mock.call.decrypt(b"KCM")])
+        self.assertEqual(connector.mock_calls, [mock.call.add_candidate(c)])
+        self.assertEqual(t.mock_calls, [])
+        clear_mock_calls(n, connector, t, m)
+
+        # now pretend this connection wins (either the Leader decides to use
+        # this one among all the candiates, or we're the Follower and the
+        # Connector is reacting to add_candidate() by recognizing we're the
+        # only candidate there is)
+        c.select(m)
+        self.assertIdentical(c._manager, m)
+        if role is LEADER:
+            # TODO: currently Connector.select_and_stop_remaining() is
+            # responsible for sending the KCM just before calling c.select()
+            # iff we're the LEADER, therefore Connection.select won't send
+            # anything. This should be moved to c.select().
+            self.assertEqual(n.mock_calls, [])
+            self.assertEqual(connector.mock_calls, [])
+            self.assertEqual(t.mock_calls, [])
+            self.assertEqual(m.mock_calls, [])
+
+            c.send_record(KCM())
+            self.assertEqual(n.mock_calls, [
+                mock.call.encrypt(encode_record(t_kcm)),
+                ])
+            self.assertEqual(connector.mock_calls, [])
+            self.assertEqual(t.mock_calls, [mock.call.write(exp_kcm)])
+            self.assertEqual(m.mock_calls, [])
+        else:
+            # follower: we already sent the KCM, do nothing
+            self.assertEqual(n.mock_calls, [])
+            self.assertEqual(connector.mock_calls, [])
+            self.assertEqual(t.mock_calls, [])
+            self.assertEqual(m.mock_calls, [])
+        clear_mock_calls(n, connector, t, m)
+
+        c.dataReceived(b"\x00\x00\x00\x04msg1")
+        self.assertEqual(n.mock_calls, [mock.call.decrypt(b"msg1")])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [])
+        self.assertEqual(m.mock_calls, [mock.call.got_record(t_open)])
+        clear_mock_calls(n, connector, t, m)
+
+        c.send_record(t_ack)
+        exp_ack = b"\x06\x55\x66\x77\x88"
+        self.assertEqual(n.mock_calls, [mock.call.encrypt(exp_ack)])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.write(b"\x00\x00\x00\x04ack1")])
+        self.assertEqual(m.mock_calls, [])
+        clear_mock_calls(n, connector, t, m)
+
+        c.disconnect()
+        self.assertEqual(n.mock_calls, [])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.loseConnection()])
+        self.assertEqual(m.mock_calls, [])
+        clear_mock_calls(n, connector, t, m)
+
+    def test_no_relay_leader(self):
+        return self._test_no_relay(LEADER)
+
+    def test_no_relay_follower(self):
+        return self._test_no_relay(FOLLOWER)
+
+
+    def test_relay(self):
+        c, n, connector, t, eq = make_con(LEADER, use_relay=True)
+
+        c.makeConnection(t)
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.write(b"relay_handshake\n")])
+        clear_mock_calls(n, connector, t)
+
+        c.dataReceived(b"ok\n")
+        self.assertEqual(n.mock_calls, [])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.write(b"outbound_prologue\n")])
+        clear_mock_calls(n, connector, t)
+
+        c.dataReceived(b"inbound_prologue\n")
+        self.assertEqual(n.mock_calls, [mock.call.write_message()])
+        self.assertEqual(connector.mock_calls, [])
+        exp_handshake = b"\x00\x00\x00\x09handshake"
+        self.assertEqual(t.mock_calls, [mock.call.write(exp_handshake)])
+        clear_mock_calls(n, connector, t)
+
+    def test_relay_jilted(self):
+        c, n, connector, t, eq = make_con(LEADER, use_relay=True)
+        d = c.when_disconnected()
+
+        c.makeConnection(t)
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.write(b"relay_handshake\n")])
+        clear_mock_calls(n, connector, t)
+
+        c.connectionLost(b"why")
+        eq.flush_sync()
+        self.assertIdentical(self.successResultOf(d), c)
+
+    def test_relay_bad_response(self):
+        c, n, connector, t, eq = make_con(LEADER, use_relay=True)
+
+        c.makeConnection(t)
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.write(b"relay_handshake\n")])
+        clear_mock_calls(n, connector, t)
+
+        c.dataReceived(b"not ok\n")
+        self.assertEqual(n.mock_calls, [])
+        self.assertEqual(connector.mock_calls, [])
+        self.assertEqual(t.mock_calls, [mock.call.loseConnection()])
+        clear_mock_calls(n, connector, t)

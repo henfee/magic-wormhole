@@ -1,7 +1,7 @@
 from __future__ import print_function, unicode_literals
 from collections import namedtuple
 from attr import attrs, attrib
-from attr.validators import optional, instance_of, provides
+from attr.validators import instance_of, provides
 from automat import MethodicalMachine
 from zope.interface import Interface, implementer
 from twisted.python import log
@@ -91,7 +91,7 @@ class _Framer(object):
     @m.output()
     def store_relay_handshake(self, relay_handshake):
         self._outbound_relay_handshake = relay_handshake
-        self._expected_relay_handshake = b"ok\n"
+        self._expected_relay_handshake = b"ok\n" # TODO: make this configurable
     @m.output()
     def send_relay_handshake(self):
         self._transport.write(self._outbound_relay_handshake)
@@ -369,20 +369,22 @@ class DilatedConnectionProtocol(Protocol, object):
     At any given time, there is at most one active L2 connection.
     """
 
+    _eventual_queue = attrib()
     _role = attrib()
     _connector = attrib(validator=provides(IDilationConnector))
     _noise = attrib()
     _outbound_prologue = attrib(validator=instance_of(bytes))
     _inbound_prologue = attrib(validator=instance_of(bytes))
-    _use_relay = attrib(validator=instance_of(bytes))
-    _relay_handshake = attrib(validator=optional(instance_of(bytes)))
+
+    _use_relay = False
+    _relay_handshake = None
 
     m = MethodicalMachine()
-    set_trace = getattr(m, "_setTrace", lambda self, f: None)
+    set_trace = getattr(m, "_setTrace", lambda self, f: None) # pragma: no cover
 
     def __attrs_post_init__(self):
         self._manager = None # set if/when we are selected
-        self._disconnected = OneShotObserver()
+        self._disconnected = OneShotObserver(self._eventual_queue)
         self._can_send_records = False
 
     @m.state(initial=True)
@@ -397,7 +399,7 @@ class DilatedConnectionProtocol(Protocol, object):
         pass
     @m.input()
     def select(self, manager):
-        pass
+        pass # fires set_manager()
     @m.input()
     def got_record(self, record):
         pass
@@ -424,15 +426,18 @@ class DilatedConnectionProtocol(Protocol, object):
 
     # called by Connector
 
+    def use_relay(self, relay_handshake):
+        assert isinstance(relay_handshake, bytes)
+        self._use_relay = True
+        self._relay_handshake = relay_handshake
+
     def when_disconnected(self):
         return self._disconnected.when_fired()
 
     def disconnect(self):
         self.transport.loseConnection()
 
-    @m.input()
-    def select(self, manager):
-        pass # fires set_manager()
+    # select() called by Connector
 
     # called by Manager
     def send_record(self, record):
@@ -463,7 +468,7 @@ class DilatedConnectionProtocol(Protocol, object):
                 else:
                     self.got_record(token) # manager.got_record()
         except Disconnect:
-            self.loseConnection()
+            self.transport.loseConnection()
 
     def connectionLost(self, why=None):
         self._disconnected.fire(self)

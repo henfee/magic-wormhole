@@ -17,8 +17,8 @@ from .. import ipaddrs # TODO: move into _dilation/
 from .._interfaces import IDilationConnector, IDilationManager
 from ..timing import DebugTiming
 from ..observer import EmptyableSet
-from .connection import DilatedConnectionProtocol
-from .roles import LEADER, FOLLOWER
+from .connection import DilatedConnectionProtocol, KCM
+from .roles import LEADER
 
 
 # These namedtuples are "hint objects". The JSON-serializable dictionaries
@@ -155,6 +155,7 @@ class Connector(object):
     _relay_url = attrib(validator=optional(instance_of(str)))
     _manager = attrib(validator=provides(IDilationManager))
     _reactor = attrib()
+    _eventual_queue = attrib()
     _no_listen = attrib(validator=instance_of(bool))
     _tor = attrib()
     _timing = attrib()
@@ -206,7 +207,8 @@ class Connector(object):
             noise.set_as_responder()
             outbound_prologue = PROLOGUE_FOLLOWER
             inbound_prologue = PROLOGUE_LEADER
-        p = DilatedConnectionProtocol(self, noise,
+        p = DilatedConnectionProtocol(self._eventual_queue, self._role,
+                                      self, noise,
                                       outbound_prologue, inbound_prologue)
         return p
 
@@ -253,8 +255,6 @@ class Connector(object):
 
     @m.output()
     def select_and_stop_remaining(self, c):
-        if self._role is LEADER:
-            c.encrypt_and_send(b"") # leader sends KCM now
         self._winning_connection = c
         self._contenders.clear() # we no longer care who else came close
         # remove this winner from the losers, so we don't shut it down
@@ -265,6 +265,9 @@ class Connector(object):
         self.stop_pending_connections()
 
         c.select(self._manager) # subsequent frames go directly to the manager
+        if self._role is LEADER:
+            # TODO: this should live in Connection
+            c.send_record(KCM()) # leader sends KCM now
         self._manager.use_connection(c) # manager sends frames to Connection
 
     @m.output()
@@ -456,13 +459,6 @@ class Connector(object):
     # by the Leader, so the first viable connection wins.
 
     # our Connection protocols call: add_candidate
-    def got_handshake(self, c):
-        if self._role is FOLLOWER:
-            c.encrypt_and_send(b"") # follower sends KCM right away
-            # leader doesn't send KCM until selection finishes
-
-    def got_kcm(self, c):
-        self.add_candidate(c)
 
 @attrs
 class OutboundConnectionFactory(ClientFactory, object):

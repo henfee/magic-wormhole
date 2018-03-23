@@ -112,7 +112,8 @@ class _ManagerBase(object):
 
     def _start_connecting(self, role):
         self._connector = Connector(self._transit_key, self._relay_url, self,
-                                    self._reactor, self._no_listen, self._tor,
+                                    self._reactor, self._eventual_queue,
+                                    self._no_listen, self._tor,
                                     self._timing, self._side,
                                     self._eventual_queue,
                                     role)
