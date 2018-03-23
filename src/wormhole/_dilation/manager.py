@@ -41,6 +41,7 @@ class OldPeerCannotDilateError(Exception):
 @attrs
 @implementer(IDilationManager)
 class _ManagerBase(object):
+    _reactor = attrib()
     _eventual_queue = attrib()
 
     def __attrs_post_init__(self):
@@ -518,6 +519,7 @@ class ManagerFollower(_ManagerBase):
         self._next_outbound_seqnum += 2
         return to_be4(scid_num)
 
+@attrs
 @implementer(IDilator)
 class Dilator(object):
     """I launch the dilation process.
@@ -530,7 +532,10 @@ class Dilator(object):
     then we build a DilationManager and hand control to it.
     """
 
-    def __init__(self):
+    _reactor = attrib()
+    _eventual_queue = attrib()
+
+    def __attrs_post_init__(self):
         self._got_versions_d = Deferred()
 
     def wire(self, sender):
@@ -555,9 +560,9 @@ class Dilator(object):
             raise OldPeerCannotDilateError()
 
         if role is LEADER:
-            self._manager = ManagerLeader(self._eventual_queue)
+            self._manager = ManagerLeader(self._reactor, self._eventual_queue)
         else:
-            self._manager = ManagerFollower(self._eventual_queue)
+            self._manager = ManagerFollower(self._reactor, self._eventual_queue)
 
         # we could probably return the endpoints earlier
         yield self._manager.when_first_connected()
