@@ -240,7 +240,7 @@ def create(appid, relay_url, reactor, # use keyword args for everything else
         }
     wormhole_versions["app_versions"] = versions # app-specific capabilities
     b = Boss(w, side, relay_url, appid, wormhole_versions,
-             reactor, journal, tor, timing)
+             reactor, eq, journal, tor, timing)
     w._set_boss(b)
     b.start()
     return w

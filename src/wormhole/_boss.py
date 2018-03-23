@@ -34,6 +34,7 @@ class Boss(object):
     _appid = attrib(validator=instance_of(type(u"")))
     _versions = attrib(validator=instance_of(dict))
     _reactor = attrib()
+    _eventual_queue = attrib()
     _journal = attrib(validator=provides(_interfaces.IJournal))
     _tor = attrib(validator=optional(provides(_interfaces.ITorManager)))
     _timing = attrib(validator=provides(_interfaces.ITiming))
