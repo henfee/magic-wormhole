@@ -38,6 +38,11 @@ from .roles import FOLLOWER
 # states). For the specific question of sending plaintext frames, Noise will
 # refuse us unless it's ready anyways, so the question is probably moot.
 
+class IFramer(Interface):
+    pass
+class IRecord(Interface):
+    pass
+
 def first(l):
     return l[0]
 
@@ -165,9 +170,9 @@ class _Framer(object):
     # external API is: connectionMade, add_and_parse, and send_frame
 
     def add_and_parse(self, data):
-        # we can't make dataReceived an @m.input because we can't change the
-        # state from within an input. Instead, let the state choose the parser
-        # to use, and use the parsed token drive a state transition.
+        # we can't make this an @m.input because we can't change the state
+        # from within an input. Instead, let the state choose the parser to
+        # use, and use the parsed token drive a state transition.
         self._buffer += data
         while True:
             # it'd be nice to use an iterator here, but since self.parse()
@@ -266,6 +271,7 @@ def encode_record(r):
     raise TypeError(r)
 
 @attrs
+@implementer(IRecord)
 class _Record(object):
     _framer = attrib(validator=provides(IFramer))
     _noise = attrib()
@@ -337,7 +343,7 @@ class _Record(object):
     def connectionMade(self):
         self._framer.connectionMade()
 
-    def dataReceived(self, data):
+    def add_and_unframe(self, data):
         for token in self._framer.add_and_parse(data):
             if isinstance(token, Prologue):
                 self.got_prologue() # triggers send_handshake
@@ -347,7 +353,7 @@ class _Record(object):
 
     def send_record(self, r):
         message = encode_record(r)
-        frame = self._noise.send(message)
+        frame = self._noise.encrypt(message)
         self._framer.send_frame(frame)
 
 
@@ -448,7 +454,7 @@ class DilatedConnectionProtocol(Protocol, object):
 
     def dataReceived(self, data):
         try:
-            for token in self._record.dataReceived(data):
+            for token in self._record.add_and_unframe(data):
                 assert isinstance(token, Handshake_or_Records)
                 if isinstance(token, Handshake):
                     if self._role is FOLLOWER:

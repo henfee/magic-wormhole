@@ -15,6 +15,13 @@ from wormhole._dilation.subchannel import (Once, SubChannel,
                                            AlreadyClosedError,
                                            SingleUseEndpointError)
 
+from .._dilation.connection import (IFramer, _Framer, Frame, Prologue,
+                                    _Record, Handshake,
+                                    #DilatedConnectionProtocol,
+                                    Disconnect)
+from .._dilation.connection import (parse_record,
+                                    KCM, Ping, Pong, Open, Data, Close, Ack)
+
 class Encoding(unittest.TestCase):
 
     def test_be4(self):
@@ -265,11 +272,6 @@ class Endpoints(unittest.TestCase):
 
         lp.stopListening() # TODO: should this do more?
 
-from .._dilation.connection import (IFramer, _Framer, Frame, Prologue,
-                                    _Record, Handshake,
-                                    #DilatedConnectionProtocol,
-                                    Disconnect)
-
 def make_framer():
     t = mock.Mock()
     alsoProvides(t, ITransport)
@@ -374,8 +376,6 @@ class Framer(unittest.TestCase):
         self.assertEqual([Frame(frame=b"frame")],
                          list(f.add_and_parse(encoded_frame[6:])))
 
-from .._dilation.connection import (parse_record, encode_record,
-                                    KCM, Ping, Pong, Open, Data, Close, Ack)
 class Parse(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(parse_record(b"\x00"), KCM())
@@ -535,3 +535,161 @@ class Record(unittest.TestCase):
         self.assertEqual(n.mock_calls, [mock.call.start_handshake(),
                                         mock.call.send(m1)])
         self.assertEqual(f.mock_calls, [mock.call.send_frame(f1)])
+
+def make_record():
+    f = mock.Mock()
+    alsoProvides(f, IFramer)
+    n = mock.Mock() # pretends to be a Noise object
+    r = _Record(f, n)
+    return r, f, n
+
+class Record(unittest.TestCase):
+    def test_good(self):
+        # Exercise the success path. The Record instance is given each chunk
+        # of data as it arrives on Protocol.dataReceived, and is supposed to
+        # return a series of Tokens (maybe none, if the chunk was incomplete,
+        # or more than one, if the chunk was larger). Internally, it delivers
+        # the chunks to the Framer for unframing (which returns 0 or more
+        # frames), manages the Noise decryption object, and parses any
+        # decrypted messages into tokens (some of which are consumed
+        # internally, others for delivery upstairs).
+        #
+        # in the normal flow, we get:
+        #
+        # |   | Inbound   | NoiseAction   | Outbound  | ToUpstairs |
+        # |   | -         | -             | -         | -          |
+        # | 1 |           |               | prologue  |            |
+        # | 2 | prologue  |               |           |            |
+        # | 3 |           | write_message | handshake |            |
+        # | 4 | handshake | read_message  |           | Handshake  |
+        # | 5 |           | encrypt       | KCM       |            |
+        # | 6 | KCM       | decrypt       |           | KCM        |
+        # | 7 | msg1      | decrypt       |           | msg1       |
+
+        # 1: instantiating the Record instance causes the outbound prologue
+        # to be sent
+
+        # 2+3: receipt of the inbound prologue triggers creation of the
+        # ephemeral key (the "handshake") by calling noise.write_message()
+        # and then writes the handshake to the outbound transport
+
+        # 4: when the peer's handshake is received, it is delivered to
+        # noise.read_message(), which generates the shared key (enabling
+        # noise.send() and noise.decrypt()). It also delivers the Handshake
+        # token upstairs, which might (on the Follower) trigger immediate
+        # transmission of the Key Confirmation Message (KCM)
+
+        # 5: the outbound KCM is framed and fed into noise.encrypt(), then
+        # sent outbound
+
+        # 6: the peer's KCM is decrypted then delivered upstairs. The
+        # Follower treats this as a signal that it should use this connection
+        # (and drop all others).
+
+        # 7: the peer's first message is decrypted, parsed, and delivered
+        # upstairs. This might be an Open or a Data, depending upon what
+        # queued messages were left over from the previous connection
+
+        r, f, n = make_record()
+        outbound_handshake = object()
+        kcm, msg1 = object(), object()
+        f_kcm, f_msg1 = object(), object()
+        n.write_message = mock.Mock(return_value=outbound_handshake)
+        n.decrypt = mock.Mock(side_effect=[kcm, msg1])
+        n.encrypt = mock.Mock(side_effect=[f_kcm, f_msg1])
+        f.add_and_parse = mock.Mock(side_effect=[[], # no tokens yet
+                                                 [Prologue()],
+                                                 [Frame("f_handshake")],
+                                                 [Frame("f_kcm"),
+                                                  Frame("f_msg1")],
+                                                 ])
+
+        self.assertEqual(f.mock_calls, [])
+        self.assertEqual(n.mock_calls, [mock.call.start_handshake()])
+        n.mock_calls[:] = []
+
+        # 1. The Framer is responsible for sending the prologue, so we don't
+        # have to check that here, we just check that the Framer was told
+        # about connectionMade properly.
+        r.connectionMade()
+        self.assertEqual(f.mock_calls, [mock.call.connectionMade()])
+        self.assertEqual(n.mock_calls, [])
+        f.mock_calls[:] = []
+
+        # 2
+        # we dribble the prologue in over two messages, to make sure we can
+        # handle a dataReceived that doesn't complete the token
+
+        # remember, add_and_unframe is a generator
+        self.assertEqual(list(r.add_and_unframe(b"pro")), [])
+        self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"pro")])
+        self.assertEqual(n.mock_calls, [])
+        f.mock_calls[:] = []
+
+        self.assertEqual(list(r.add_and_unframe(b"logue")), [])
+        # 3: write_message, send outbound handshake
+        self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"logue"),
+                                        mock.call.send_frame(outbound_handshake),
+                                        ])
+        self.assertEqual(n.mock_calls, [mock.call.write_message()])
+        f.mock_calls[:] = []
+        n.mock_calls[:] = []
+
+        # 4
+        # Now deliver the Noise "handshake", the ephemeral public key. This
+        # is framed, but not a record, so it shouldn't decrypt or parse
+        # anything, but the handshake is delivered to the Noise object, and
+        # it does return a Handshake token so we can let the next layer up
+        # react (by sending the KCM frame if we're a Follower, or not if
+        # we're the Leader)
+
+        self.assertEqual(list(r.add_and_unframe(b"handshake")), [Handshake()])
+        self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"handshake")])
+        self.assertEqual(n.mock_calls, [mock.call.read_message("f_handshake")])
+        f.mock_calls[:] = []
+        n.mock_calls[:] = []
+
+
+        # 5: at this point we ought to be able to send a messge, the KCM
+        with mock.patch("wormhole._dilation.connection.encode_record",
+                        side_effect=[b"r-kcm"]) as er:
+            r.send_record(kcm)
+        self.assertEqual(er.mock_calls, [mock.call(kcm)])
+        self.assertEqual(n.mock_calls, [mock.call.encrypt(b"r-kcm")])
+        self.assertEqual(f.mock_calls, [mock.call.send_frame(f_kcm)])
+        n.mock_calls[:] = []
+        f.mock_calls[:] = []
+
+        # 6: Now we deliver two messages stacked up: the KCM (Key
+        # Confirmation Message) and the first real message. Concatenating
+        # them tests that we can handle more than one token in a single
+        # chunk. We need to mock parse_record() because everything past the
+        # handshake is decrypted and parsed.
+
+        with mock.patch("wormhole._dilation.connection.parse_record",
+                        side_effect=[kcm, msg1]) as pr:
+            self.assertEqual(list(r.add_and_unframe(b"kcm,msg1")),
+                             [kcm, msg1])
+            self.assertEqual(f.mock_calls,
+                             [mock.call.add_and_parse(b"kcm,msg1")])
+            self.assertEqual(n.mock_calls, [mock.call.decrypt("f_kcm"),
+                                            mock.call.decrypt("f_msg1")])
+        n.mock_calls[:] = []
+        f.mock_calls[:] = []
+
+    def test_bad_handshake(self):
+        r, f, n = make_record()
+        n.write_message = mock.Mock(return_value=object())
+        from noise.exceptions import NoiseInvalidMessage
+        n.read_message = mock.Mock(side_effect=[NoiseInvalidMessage("eww")])
+        f.add_and_parse = mock.Mock(side_effect=[[Prologue()],
+                                                 [Frame("f_bad_handshake")],
+                                                 ])
+        r.connectionMade()
+        list(r.add_and_unframe(b"prologue"))
+        with self.assertRaises(Disconnect):
+            list(r.add_and_unframe(b"bad-handshake"))
+        errs = self.flushLoggedErrors(NoiseInvalidMessage)
+        self.assertEqual(len(errs), 1)
+        f = errs[0]
+        self.assertEqual(f.value.args, ("eww",))
