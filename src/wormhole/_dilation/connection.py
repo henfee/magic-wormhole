@@ -52,9 +52,6 @@ RelayOK = namedtuple("RelayOk", [])
 Prologue = namedtuple("Prologue", [])
 Frame = namedtuple("Frame", ["frame"])
 
-class IFramer(Interface):
-    pass
-
 @attrs
 @implementer(IFramer)
 class _Framer(object):

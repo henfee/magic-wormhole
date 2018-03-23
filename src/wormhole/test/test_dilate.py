@@ -19,7 +19,7 @@ from .._dilation.connection import (IFramer, _Framer, Frame, Prologue,
                                     _Record, Handshake,
                                     #DilatedConnectionProtocol,
                                     Disconnect)
-from .._dilation.connection import (parse_record,
+from .._dilation.connection import (parse_record, encode_record,
                                     KCM, Ping, Pong, Open, Data, Close, Ack)
 
 class Encoding(unittest.TestCase):
@@ -417,8 +417,15 @@ class Parse(unittest.TestCase):
 
 from noise.exceptions import NoiseInvalidMessage
 
+def make_record():
+    f = mock.Mock()
+    alsoProvides(f, IFramer)
+    n = mock.Mock() # pretends to be a Noise object
+    r = _Record(f, n)
+    return r, f, n
+
 class Record(unittest.TestCase):
-    def test_dataReceived(self):
+    def test_good2(self):
         f = mock.Mock()
         alsoProvides(f, IFramer)
         f.add_and_parse = mock.Mock(side_effect=[
@@ -442,21 +449,21 @@ class Record(unittest.TestCase):
         # Pretend to deliver the prologue in two parts. The text we send in
         # doesn't matter: the side_effect= is what causes the prologue to be
         # recognized by the second call.
-        self.assertEqual(list(r.dataReceived(b"pro")), [])
+        self.assertEqual(list(r.add_and_unframe(b"pro")), [])
         self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"pro")])
         f.mock_calls[:] = []
         self.assertEqual(n.mock_calls, [])
 
         # recognizing the prologue causes a handshake frame to be sent
-        self.assertEqual(list(r.dataReceived(b"logue")), [])
+        self.assertEqual(list(r.add_and_unframe(b"logue")), [])
         self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"logue"),
                                         mock.call.send_frame(b"tx-handshake")])
         f.mock_calls[:] = []
         self.assertEqual(n.mock_calls, [mock.call.write_message()])
         n.mock_calls[:] = []
 
-        # next dataReceived is recognized as the Handshake
-        self.assertEqual(list(r.dataReceived(b"blah")), [Handshake()])
+        # next add_and_unframe is recognized as the Handshake
+        self.assertEqual(list(r.add_and_unframe(b"blah")), [Handshake()])
         self.assertEqual(f.mock_calls, [mock.call.add_and_parse(b"blah")])
         f.mock_calls[:] = []
         self.assertEqual(n.mock_calls, [mock.call.read_message(b"rx-handshake")])
@@ -466,7 +473,7 @@ class Record(unittest.TestCase):
         r1, r2 = object() , object()
         with mock.patch("wormhole._dilation.connection.parse_record",
                         side_effect=[r1,r2]) as pr:
-            self.assertEqual(list(r.dataReceived(b"blah2")), [r1, r2])
+            self.assertEqual(list(r.add_and_unframe(b"blah2")), [r1, r2])
             self.assertEqual(n.mock_calls, [mock.call.decrypt(b"frame1"),
                                             mock.call.decrypt(b"frame2")])
             self.assertEqual(pr.mock_calls, [mock.call(p1), mock.call(p2)])
@@ -490,7 +497,7 @@ class Record(unittest.TestCase):
 
         with mock.patch("wormhole._dilation.connection.log.err") as le:
             with self.assertRaises(Disconnect):
-                list(r.dataReceived(b"data"))
+                list(r.add_and_unframe(b"data"))
         self.assertEqual(le.mock_calls,
                          [mock.call(nvm, "bad inbound noise handshake")])
 
@@ -514,7 +521,7 @@ class Record(unittest.TestCase):
 
         with mock.patch("wormhole._dilation.connection.log.err") as le:
             with self.assertRaises(Disconnect):
-                list(r.dataReceived(b"data"))
+                list(r.add_and_unframe(b"data"))
         self.assertEqual(le.mock_calls,
                          [mock.call(nvm, "bad inbound noise frame")])
 
@@ -523,7 +530,7 @@ class Record(unittest.TestCase):
         alsoProvides(f, IFramer)
         n = mock.Mock()
         f1 = object()
-        n.send = mock.Mock(return_value=f1)
+        n.encrypt = mock.Mock(return_value=f1)
         r1 = Ping(b"pingid")
         r = _Record(f, n)
         self.assertEqual(f.mock_calls, [])
@@ -533,17 +540,9 @@ class Record(unittest.TestCase):
             r.send_record(r1)
         self.assertEqual(er.mock_calls, [mock.call(r1)])
         self.assertEqual(n.mock_calls, [mock.call.start_handshake(),
-                                        mock.call.send(m1)])
+                                        mock.call.encrypt(m1)])
         self.assertEqual(f.mock_calls, [mock.call.send_frame(f1)])
 
-def make_record():
-    f = mock.Mock()
-    alsoProvides(f, IFramer)
-    n = mock.Mock() # pretends to be a Noise object
-    r = _Record(f, n)
-    return r, f, n
-
-class Record(unittest.TestCase):
     def test_good(self):
         # Exercise the success path. The Record instance is given each chunk
         # of data as it arrives on Protocol.dataReceived, and is supposed to
@@ -674,22 +673,6 @@ class Record(unittest.TestCase):
                              [mock.call.add_and_parse(b"kcm,msg1")])
             self.assertEqual(n.mock_calls, [mock.call.decrypt("f_kcm"),
                                             mock.call.decrypt("f_msg1")])
+            self.assertEqual(pr.mock_calls, [mock.call(kcm), mock.call(msg1)])
         n.mock_calls[:] = []
         f.mock_calls[:] = []
-
-    def test_bad_handshake(self):
-        r, f, n = make_record()
-        n.write_message = mock.Mock(return_value=object())
-        from noise.exceptions import NoiseInvalidMessage
-        n.read_message = mock.Mock(side_effect=[NoiseInvalidMessage("eww")])
-        f.add_and_parse = mock.Mock(side_effect=[[Prologue()],
-                                                 [Frame("f_bad_handshake")],
-                                                 ])
-        r.connectionMade()
-        list(r.add_and_unframe(b"prologue"))
-        with self.assertRaises(Disconnect):
-            list(r.add_and_unframe(b"bad-handshake"))
-        errs = self.flushLoggedErrors(NoiseInvalidMessage)
-        self.assertEqual(len(errs), 1)
-        f = errs[0]
-        self.assertEqual(f.value.args, ("eww",))
