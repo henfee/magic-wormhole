@@ -1,5 +1,6 @@
 from __future__ import print_function, unicode_literals
 from collections import namedtuple
+import six
 from attr import attrs, attrib
 from attr.validators import instance_of, provides
 from automat import MethodicalMachine
@@ -204,12 +205,12 @@ class _Framer(object):
 Handshake = namedtuple("Handshake", [])
 # decrypted frames: produces KCM, Ping, Pong, Open, Data, Close, Ack
 KCM = namedtuple("KCM", [])
-Ping = namedtuple("Ping", ["ping_id"])
+Ping = namedtuple("Ping", ["ping_id"]) # ping_id is arbitrary 4-byte value
 Pong = namedtuple("Pong", ["ping_id"])
-Open = namedtuple("Open", ["seqnum", "scid"])
+Open = namedtuple("Open", ["seqnum", "scid"]) # seqnum is integer
 Data = namedtuple("Data", ["seqnum", "scid", "data"])
-Close = namedtuple("Close", ["seqnum", "scid"])
-Ack = namedtuple("Ack", ["resp_seqnum"])
+Close = namedtuple("Close", ["seqnum", "scid"]) # scid is integer
+Ack = namedtuple("Ack", ["resp_seqnum"]) # resp_seqnum is integer
 Records = (KCM, Ping, Pong, Open, Data, Close, Ack)
 Handshake_or_Records = (Handshake,) + Records
 
@@ -232,20 +233,20 @@ def parse_record(plaintext):
         ping_id = plaintext[1:5]
         return Pong(ping_id)
     if msgtype == T_OPEN:
-        scid = plaintext[1:5]
-        seqnum = plaintext[5:9]
+        scid = from_be4(plaintext[1:5])
+        seqnum = from_be4(plaintext[5:9])
         return Open(seqnum, scid)
     if msgtype == T_DATA:
-        scid = plaintext[1:5]
-        seqnum = plaintext[5:9]
+        scid = from_be4(plaintext[1:5])
+        seqnum = from_be4(plaintext[5:9])
         data = plaintext[9:]
         return Data(seqnum, scid, data)
     if msgtype == T_CLOSE:
-        scid = plaintext[1:5]
-        seqnum = plaintext[5:9]
+        scid = from_be4(plaintext[1:5])
+        seqnum = from_be4(plaintext[5:9])
         return Close(seqnum, scid)
     if msgtype == T_ACK:
-        resp_seqnum = plaintext[1:5]
+        resp_seqnum = from_be4(plaintext[1:5])
         return Ack(resp_seqnum)
     log.err("received unknown message type: {}".format(plaintext))
     raise ValueError()
@@ -258,13 +259,20 @@ def encode_record(r):
     if isinstance(r, Pong):
         return b"\x02" + r.ping_id
     if isinstance(r, Open):
-        return b"\x03" + r.scid + r.seqnum
+        assert isinstance(r.scid, six.integer_types)
+        assert isinstance(r.seqnum, six.integer_types)
+        return b"\x03" + to_be4(r.scid) + to_be4(r.seqnum)
     if isinstance(r, Data):
-        return b"\x04" + r.scid + r.seqnum + r.data
+        assert isinstance(r.scid, six.integer_types)
+        assert isinstance(r.seqnum, six.integer_types)
+        return b"\x04" + to_be4(r.scid) + to_be4(r.seqnum) + r.data
     if isinstance(r, Close):
-        return b"\x05" + r.scid + r.seqnum
+        assert isinstance(r.scid, six.integer_types)
+        assert isinstance(r.seqnum, six.integer_types)
+        return b"\x05" + to_be4(r.scid) + to_be4(r.seqnum)
     if isinstance(r, Ack):
-        return b"\x06" + r.resp_seqnum
+        assert isinstance(r.resp_seqnum, six.integer_types)
+        return b"\x06" + to_be4(r.resp_seqnum)
     raise TypeError(r)
 
 @attrs

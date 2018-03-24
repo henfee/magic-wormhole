@@ -387,14 +387,14 @@ class Parse(unittest.TestCase):
                          Ping(ping_id=b"\x55\x44\x33\x22"))
         self.assertEqual(parse_record(b"\x02\x55\x44\x33\x22"),
                          Pong(ping_id=b"\x55\x44\x33\x22"))
-        self.assertEqual(parse_record(b"\x03scidseqn"),
-                         Open(scid=b"scid", seqnum=b"seqn"))
-        self.assertEqual(parse_record(b"\x04scidseqndataaa"),
-                         Data(scid=b"scid", seqnum=b"seqn", data=b"dataaa"))
-        self.assertEqual(parse_record(b"\x05scidseqn"),
-                         Close(scid=b"scid", seqnum=b"seqn"))
-        self.assertEqual(parse_record(b"\x06seqn"),
-                         Ack(resp_seqnum=b"seqn"))
+        self.assertEqual(parse_record(b"\x03\x00\x00\x02\x01\x00\x00\x01\x00"),
+                         Open(scid=513, seqnum=256))
+        self.assertEqual(parse_record(b"\x04\x00\x00\x02\x02\x00\x00\x01\x01dataaa"),
+                         Data(scid=514, seqnum=257, data=b"dataaa"))
+        self.assertEqual(parse_record(b"\x05\x00\x00\x02\x03\x00\x00\x01\x02"),
+                         Close(scid=515, seqnum=258))
+        self.assertEqual(parse_record(b"\x06\x00\x00\x01\x03"),
+                         Ack(resp_seqnum=259))
         with mock.patch("wormhole._dilation.connection.log.err") as le:
             with self.assertRaises(ValueError):
                 parse_record(b"\x07unknown")
@@ -406,15 +406,14 @@ class Parse(unittest.TestCase):
         self.assertEqual(encode_record(KCM()), b"\x00")
         self.assertEqual(encode_record(Ping(ping_id=b"ping")), b"\x01ping")
         self.assertEqual(encode_record(Pong(ping_id=b"pong")), b"\x02pong")
-        self.assertEqual(encode_record(Open(scid=b"scid", seqnum=b"seqn")),
-                         b"\x03scidseqn")
-        self.assertEqual(encode_record(Data(scid=b"scid", seqnum=b"seqn",
-                                            data=b"dataaa")),
-                         b"\x04scidseqndataaa")
-        self.assertEqual(encode_record(Close(scid=b"scid", seqnum=b"seqn")),
-                         b"\x05scidseqn")
-        self.assertEqual(encode_record(Ack(resp_seqnum=b"seqn")),
-                         b"\x06seqn")
+        self.assertEqual(encode_record(Open(scid=65536, seqnum=16)),
+                         b"\x03\x00\x01\x00\x00\x00\x00\x00\x10")
+        self.assertEqual(encode_record(Data(scid=65537, seqnum=17, data=b"dataaa")),
+                         b"\x04\x00\x01\x00\x01\x00\x00\x00\x11dataaa")
+        self.assertEqual(encode_record(Close(scid=65538, seqnum=18)),
+                         b"\x05\x00\x01\x00\x02\x00\x00\x00\x12")
+        self.assertEqual(encode_record(Ack(resp_seqnum=19)),
+                         b"\x06\x00\x00\x00\x13")
         with self.assertRaises(TypeError) as ar:
             encode_record("not a record")
         self.assertEqual(str(ar.exception), "not a record")
@@ -727,8 +726,8 @@ class Connection(unittest.TestCase):
     def _test_no_relay(self, role):
         c, n, connector, t, eq = make_con(role)
         t_kcm = KCM()
-        t_open = Open(seqnum=b"\x00\x01\x02\x03", scid=b"\x11\x22\x33\x44")
-        t_ack = Ack(resp_seqnum=b"\x55\x66\x77\x88")
+        t_open = Open(seqnum=1, scid=0x11223344)
+        t_ack = Ack(resp_seqnum=2)
         n.decrypt = mock.Mock(side_effect=[
             encode_record(t_kcm),
             encode_record(t_open),
@@ -820,7 +819,7 @@ class Connection(unittest.TestCase):
         clear_mock_calls(n, connector, t, m)
 
         c.send_record(t_ack)
-        exp_ack = b"\x06\x55\x66\x77\x88"
+        exp_ack = b"\x06\x00\x00\x00\x02"
         self.assertEqual(n.mock_calls, [mock.call.encrypt(exp_ack)])
         self.assertEqual(connector.mock_calls, [])
         self.assertEqual(t.mock_calls, [mock.call.write(b"\x00\x00\x00\x04ack1")])
