@@ -5,19 +5,20 @@ from twisted.trial import unittest
 from twisted.internet.task import Clock
 from twisted.internet.interfaces import ITransport
 from twisted.internet.error import ConnectionDone
+from noise.exceptions import NoiseInvalidMessage
 from ..eventual import EventualQueue
-from wormhole._interfaces import (IDilationManager, IDilationConnector,
-                                  IWormhole, ISubChannel)
-from wormhole._dilation.roles import LEADER, FOLLOWER
-from wormhole._dilation.encode import to_be4, from_be4
-from wormhole._dilation.subchannel import (Once, SubChannel,
-                                           ControlEndpoint,
-                                           SubchannelConnectorEndpoint,
-                                           SubchannelListenerEndpoint,
-                                           SubchannelListeningPort,
-                                           _WormholeAddress, _SubchannelAddress,
-                                           AlreadyClosedError,
-                                           SingleUseEndpointError)
+from .._interfaces import (IDilationManager, IDilationConnector,
+                           IWormhole, ISubChannel)
+from .._dilation.roles import LEADER, FOLLOWER
+from .._dilation.encode import to_be4, from_be4
+from .._dilation.subchannel import (Once, SubChannel,
+                                    ControlEndpoint,
+                                    SubchannelConnectorEndpoint,
+                                    SubchannelListenerEndpoint,
+                                    SubchannelListeningPort,
+                                    _WormholeAddress, _SubchannelAddress,
+                                    AlreadyClosedError,
+                                    SingleUseEndpointError)
 
 from .._dilation.connection import (IFramer, _Framer, Frame, Prologue,
                                     _Record, Handshake,
@@ -25,6 +26,7 @@ from .._dilation.connection import (IFramer, _Framer, Frame, Prologue,
                                     Disconnect)
 from .._dilation.connection import (parse_record, encode_record,
                                     KCM, Ping, Pong, Open, Data, Close, Ack)
+
 
 class Encoding(unittest.TestCase):
 
@@ -417,8 +419,6 @@ class Parse(unittest.TestCase):
         with self.assertRaises(TypeError) as ar:
             encode_record("not a record")
         self.assertEqual(str(ar.exception), "not a record")
-
-from noise.exceptions import NoiseInvalidMessage
 
 def make_record():
     f = mock.Mock()
