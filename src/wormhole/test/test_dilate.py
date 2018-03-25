@@ -29,6 +29,7 @@ from .._dilation.connection import (parse_record, encode_record,
 from .._dilation.inbound import (Inbound, DuplicateOpenError,
                                  DataForMissingSubchannelError,
                                  CloseForMissingSubchannelError)
+from .._dilation.outbound import Outbound
 
 
 class Encoding(unittest.TestCase):
@@ -1056,4 +1057,117 @@ class InboundTest(unittest.TestCase):
         i.subchannel_stopProducing(sc2)
         self.assertEqual(c.mock_calls, [mock.call.resumeProducing()])
         c.mock_calls[:] = []
+
+def make_outbound(pausing=False):
+    m = mock.Mock()
+    alsoProvides(m, IDilationManager)
+    o = Outbound(m)
+    c = mock.Mock() # Connection
+    if pausing:
+        c.send_record = mock.Mock(side_effect=lambda r: o.pauseProducing())
+    return o, m, c
+
+class OutboundTest(unittest.TestCase):
+    def test_build_record(self):
+        o, m, c = make_outbound()
+        scid1 = b"scid"
+        self.assertEqual(o.build_record(Open, scid1),
+                         Open(seqnum=0, scid=b"scid"))
+        self.assertEqual(o.build_record(Data, scid1, b"dataaa"),
+                         Data(seqnum=1, scid=b"scid", data=b"dataaa"))
+        self.assertEqual(o.build_record(Close, scid1),
+                         Close(seqnum=2, scid=b"scid"))
+        self.assertEqual(o.build_record(Close, scid1),
+                         Close(seqnum=3, scid=b"scid"))
+
+    def test_outbound_queue(self):
+        o, m, c = make_outbound()
+        scid1 = b"scid"
+        r1 = o.build_record(Open, scid1)
+        r2 = o.build_record(Data, scid1, b"data1")
+        r3 = o.build_record(Data, scid1, b"data2")
+        o.queue_and_send_record(r1)
+        o.queue_and_send_record(r2)
+        o.queue_and_send_record(r3)
+        self.assertEqual(list(o._outbound_queue), [r1, r2, r3])
+
+        # we would never normally receive an ACK without first getting a
+        # connection
+        o.handle_ack(r2.seqnum)
+        self.assertEqual(list(o._outbound_queue), [r3])
+
+        o.handle_ack(r3.seqnum)
+        self.assertEqual(list(o._outbound_queue), [])
+
+        o.handle_ack(r3.seqnum) # ignored
+        self.assertEqual(list(o._outbound_queue), [])
+
+        o.handle_ack(r1.seqnum) # ignored
+        self.assertEqual(list(o._outbound_queue), [])
+
+    def test_connection(self):
+        o, m, c = make_outbound()
+        o.use_connection(c)
+        self.assertEqual(c.mock_calls, [mock.call.registerProducer(o, True)])
+        c.mock_calls[:] = []
+
+        o.stop_using_connection()
+        self.assertEqual(c.mock_calls, [mock.call.unregisterProducer()])
+        c.mock_calls[:] = []
+
+    def test_connection_send_queued_unpaused(self):
+        o, m, c = make_outbound()
+        scid1 = b"scid"
+        r1 = o.build_record(Open, scid1)
+        r2 = o.build_record(Data, scid1, b"data1")
+        r3 = o.build_record(Data, scid1, b"data2")
+        o.queue_and_send_record(r1)
+        o.queue_and_send_record(r2)
+        self.assertEqual(list(o._outbound_queue), [r1, r2])
+        self.assertEqual(list(o._queued_unsent), [])
+
+        # as soon as the connection is established, everything is sent
+        o.use_connection(c)
+        self.assertEqual(c.mock_calls, [mock.call.registerProducer(o, True),
+                                        mock.call.send_record(r1),
+                                        mock.call.send_record(r2)])
+        self.assertEqual(list(o._outbound_queue), [r1, r2])
+        self.assertEqual(list(o._queued_unsent), [])
+        c.mock_calls[:] = []
+
+        o.queue_and_send_record(r3)
+        self.assertEqual(list(o._outbound_queue), [r1, r2, r3])
+        self.assertEqual(list(o._queued_unsent), [])
+        self.assertEqual(c.mock_calls, [mock.call.send_record(r3)])
+
+    def test_connection_send_queued_paused(self):
+        o, m, c = make_outbound(pausing=True)
+        scid1 = b"scid"
+        r1 = o.build_record(Open, scid1)
+        r2 = o.build_record(Data, scid1, b"data1")
+        r3 = o.build_record(Data, scid1, b"data2")
+        o.queue_and_send_record(r1)
+        o.queue_and_send_record(r2)
+        self.assertEqual(list(o._outbound_queue), [r1, r2])
+        self.assertEqual(list(o._queued_unsent), [])
+
+        # pausing=True, so our mock Manager will pause the Outbound producer
+        # after each write. So only r1 should have been sent before getting
+        # paused
+        o.use_connection(c)
+        self.assertEqual(c.mock_calls, [mock.call.registerProducer(o, True),
+                                        mock.call.send_record(r1)])
+        self.assertEqual(list(o._outbound_queue), [r1, r2])
+        self.assertEqual(list(o._queued_unsent), [r2])
+        c.mock_calls[:] = []
+
+        # Outbound is responsible for sending all records, so when Manager
+        # wants to send a new one, and Outbound is still in the middle of
+        # draining the beginning-of-connection queue, the new message gets
+        # queued behind the rest (in addition to being queued in
+        # _outbound_queue until an ACK retires it).
+        o.queue_and_send_record(r3)
+        self.assertEqual(list(o._outbound_queue), [r1, r2, r3])
+        self.assertEqual(list(o._queued_unsent), [r2, r3])
+        self.assertEqual(c.mock_calls, [])
 

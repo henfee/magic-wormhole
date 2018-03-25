@@ -4,6 +4,7 @@ from attr import attrs, attrib
 from attr.validators import provides
 from zope.interface import implementer
 from .._interfaces import IDilationManager, IOutbound
+from .connection import KCM, Ping, Pong, Ack
 
 
 # Outbound flow control: app writes to subchannel, we write to Connection
@@ -169,6 +170,9 @@ class Outbound(object):
         self._pull_producers = set()
         self._paused_push_producers = set()
         self._unpaused_push_producers = set()
+        self._check_invariants()
+
+        self._connection = None
 
     def _check_invariants(self):
         assert self._pull_producers.isdisjoint(self._unpaused_push_producers)
@@ -186,8 +190,23 @@ class Outbound(object):
         assert hasattr(r, "seqnum"), r # only Open/Data/Close
         return r
 
-    def queue_record(self, r):
+    def queue_and_send_record(self, r):
+        # we always queue it, to resend on a subsequent connection if
+        # necessary
         self._outbound_queue.append(r)
+
+        if self._connection:
+            if self._queued_unsent:
+                # to maintain correct ordering, queue this instead of sending it
+                self._queued_unsent.append(r)
+            else:
+                # we're allowed to send it immediately
+                self._connection.send_record(r)
+
+    def send_if_connected(self, r):
+        assert isinstance(r, (KCM, Ping, Pong, Ack)), r # nothing with seqnum
+        if self._connection:
+            self._connection.send_record(r)
 
     # our subchannels call these to register a producer
 
@@ -241,6 +260,7 @@ class Outbound(object):
     # our Manager tells us when we've got a new Connection to work with
 
     def use_connection(self, c):
+        self._connection = c
         assert not self._queued_unsent
         self._queued_unsent.extend(self._outbound_queue)
         # the connection can tell us to pause when we send too much data
@@ -249,6 +269,8 @@ class Outbound(object):
         self.resumeProducing()
 
     def stop_using_connection(self):
+        self._connection.unregisterProducer()
+        self._connection = None
         self._queued_unsent.clear()
         self.pauseProducing()
         # TODO: I expect this will call pauseProducing twice: the first time
@@ -271,6 +293,7 @@ class Outbound(object):
     # IProducer: the active connection calls these because we used
     # c.registerProducer to ask for them
     def pauseProducing(self):
+        #print("pauseProducing")
         if self._paused:
             return # someone is confused and called us twice
         self._paused = True
@@ -287,8 +310,10 @@ class Outbound(object):
 
         while not self._paused:
             if self._queued_unsent:
+                #print("send_record from _queued_unsent")
                 r = self._queued_unsent.popleft()
-                self._manager._send_record(r)
+                self._connection.send_record(r)
+                #print("done send_record from _queued_unsent")
                 continue
             p = self._get_next_unpaused_producer()
             if not p:

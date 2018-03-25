@@ -87,14 +87,10 @@ class _ManagerBase(object):
 
     def _queue_and_send(self, record_type, *args):
         r = self._outbound.build_record(record_type, *args)
-        self._outbound.queue_record(r)
-        if self._connection:
-            self._send_record(r)
-
-    def send_record(self, r):
-        # Outbound uses this to send queued messages when the connection is
-        # established
-        self._connection.send_record(r) # may trigger pauseProducing
+        # Outbound owns the send_record() pipe, so that it can stall new
+        # writes after a new connection is made until after all queued
+        # messages are written (to preserve ordering).
+        self._outbound.queue_and_send_record(r) # may trigger pauseProducing
 
     def subchannel_closed(self, scid, sc):
         # let everyone clean up. This happens just after we delivered
@@ -158,16 +154,14 @@ class _ManagerBase(object):
 
     # pings, pongs, and acks are not queued
     def send_ping(self, ping_id):
-        if self._connection:
-            self._connection.send_record(Ping(ping_id))
+        self._outbound.send_if_connected(Ping(ping_id))
 
     def send_pong(self, ping_id):
-        if self._connection:
-            self._connection.send_record(Pong(ping_id))
+        self._outbound.send_if_connected(Pong(ping_id))
 
     def send_ack(self, resp_seqnum):
-        if self._connection:
-            self._connection.send_record(Ack(resp_seqnum))
+        self._outbound.send_if_connected(Ack(resp_seqnum))
+
 
     def handle_ping(self, ping_id):
         self.send_pong(ping_id)
