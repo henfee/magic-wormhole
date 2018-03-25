@@ -6,6 +6,13 @@ from twisted.python import log
 from .._interfaces import IDilationManager, IInbound
 from .subchannel import (SubChannel, _SubchannelAddress)
 
+class DuplicateOpenError(Exception):
+    pass
+class DataForMissingSubchannelError(Exception):
+    pass
+class CloseForMissingSubchannelError(Exception):
+    pass
+
 @attrs
 @implementer(IInbound)
 class Inbound(object):
@@ -21,6 +28,7 @@ class Inbound(object):
         self._paused_subchannels = set() # Subchannels that have paused us
         # the set is non-empty, we pause the transport
         self._highest_inbound_acked = -1
+        self._connection = None
 
     # from our Manager
     def set_listener_endpoint(self, listener_endpoint):
@@ -53,7 +61,7 @@ class Inbound(object):
 
     def handle_open(self, scid):
         if scid in self._open_subchannels:
-            log.err("received duplicate OPEN for {}".format(scid))
+            log.err(DuplicateOpenError("received duplicate OPEN for {}".format(scid)))
             return
         peer_addr = _SubchannelAddress(scid)
         sc = SubChannel(scid, self._manager, self._host_addr, peer_addr)
@@ -63,14 +71,14 @@ class Inbound(object):
     def handle_data(self, scid, data):
         sc = self._open_subchannels.get(scid)
         if sc is None:
-            log.err("received DATA for non-existent subchannel {}".format(scid))
+            log.err(DataForMissingSubchannelError("received DATA for non-existent subchannel {}".format(scid)))
             return
         sc.remote_data(data)
 
     def handle_close(self, scid):
         sc = self._open_subchannels.get(scid)
         if sc is None:
-            log.err("received CLOSE for non-existent subchannel {}".format(scid))
+            log.err(CloseForMissingSubchannelError("received CLOSE for non-existent subchannel {}".format(scid)))
             return
         sc.remote_close()
 
