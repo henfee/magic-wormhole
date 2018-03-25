@@ -176,6 +176,11 @@ class SubChannel(object):
         self._manager.subchannel_resumeProducing(self)
 
     # IConsumer: allow the wormhole to throttle outbound data (app->wormhole)
+
+    # TODO: register an adapter instead, which is always IPushProducer. If our
+    # caller gives us an IPullProducer, we manage the mismatch. Our adapter
+    # needs to know about our .write calls to do this properly and tolerate an
+    # IPullProducer which doesn't always do a write
     def registerProducer(self, producer, streaming):
         self._manager.subchannel_registerProducer(self, producer, streaming)
     def unregisterProducer(self):

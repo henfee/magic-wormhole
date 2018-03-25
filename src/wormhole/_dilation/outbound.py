@@ -225,7 +225,7 @@ class Outbound(object):
             if self._paused:
                 self._paused_push_producers.add(producer)
             else:
-                self._unpaused_producers.add(producer)
+                self._unpaused_push_producers.add(producer)
         else:
             self._pull_producers.add(producer)
         self._check_invariants()
@@ -240,6 +240,7 @@ class Outbound(object):
             # IPullProducers hit the ground running
             if not streaming:
                 producer.resumeProducing() # you wake up screaming
+                # TODO: only one call? or repeat until we're paused?
 
     def subchannel_unregisterProducer(self, sc):
         # TODO: what if the subchannel closes, so we unregister their
@@ -249,7 +250,7 @@ class Outbound(object):
         self._all_producers.remove(p)
         self._pull_producers.discard(p)
         self._paused_push_producers.discard(p)
-        self._unpaused_producers.discard(p)
+        self._unpaused_push_producers.discard(p)
         self._check_invariants()
 
     def subchannel_closed(self, scid, sc):
@@ -293,13 +294,13 @@ class Outbound(object):
     # IProducer: the active connection calls these because we used
     # c.registerProducer to ask for them
     def pauseProducing(self):
-        #print("pauseProducing")
+        #print("pauseProducing", self._paused, self._all_producers, self._unpaused_push_producers)
         if self._paused:
             return # someone is confused and called us twice
         self._paused = True
         for p in self._all_producers:
             if p in self._unpaused_push_producers:
-                self._unpaused_push_producers.pop(p)
+                self._unpaused_push_producers.remove(p)
                 self._paused_push_producers.add(p)
                 p.pauseProducing()
 
@@ -318,7 +319,15 @@ class Outbound(object):
             p = self._get_next_unpaused_producer()
             if not p:
                 break
+            if p in self._paused_push_producers:
+                self._paused_push_producers.remove(p)
+                self._unpaused_push_producers.add(p)
+                # if it's in _pull_producers, we leave it there, it's always
+                # paused
+            #print("calling p.resumeProducing", p)
             p.resumeProducing()
+            #print("did p.resumeProducing", p, self._paused)
+        #print("done resumeProducing")
 
     def _get_next_unpaused_producer(self):
         self._check_invariants()
@@ -327,8 +336,9 @@ class Outbound(object):
         while True:
             p = self._all_producers[0]
             self._all_producers.rotate(-1) # p moves to the end of the line
-            if p in self._pull_producers or p in self._paused_push_producers:
-                return p
+            # the only unpaused Producers are at the end of the list
+            assert p in self._pull_producers or p in self._paused_push_producers
+            return p
 
     def stopProducing(self):
         # we'll hopefully have a new connection to work with in the future,
