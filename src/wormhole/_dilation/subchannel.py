@@ -167,7 +167,7 @@ class SubChannel(object):
         # and "peer addr" as the subchannel within that wormhole
         return self._peer_addr
 
-    # IProducer
+    # IProducer: throttle inbound data (wormhole "up" to local app's Protocol)
     def stopProducing(self):
         self._manager.subchannel_stopProducing(self)
     def pauseProducing(self):
@@ -175,13 +175,11 @@ class SubChannel(object):
     def resumeProducing(self):
         self._manager.subchannel_resumeProducing(self)
 
-    # IConsumer
+    # IConsumer: allow the wormhole to throttle outbound data (app->wormhole)
     def registerProducer(self, producer, streaming):
-        # streaming==True: IPushProducer (pause/resume)
-        # streaming==False: IPullProducer (just resume)
-        pass
+        self._manager.subchannel_registerProducer(self, producer, streaming)
     def unregisterProducer(self):
-        pass
+        self._manager.subchannel_unregisterProducer(self)
 
 
 @implementer(IStreamClientEndpoint)

@@ -400,3 +400,7 @@ class IDilationConnector(Interface):
     pass
 class ISubChannel(Interface):
     pass
+class IInbound(Interface):
+    pass
+class IOutbound(Interface):
+    pass
