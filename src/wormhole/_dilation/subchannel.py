@@ -115,7 +115,7 @@ class SubChannel(object):
             self._protocol.connectionLost(ConnectionDone())
         else:
             self._pending_connectionLost = (True, ConnectionDone())
-        self._manager.subchannel_closed(self._id, self)
+        self._manager.subchannel_closed(self)
         # we're deleted momentarily
 
     @m.output()

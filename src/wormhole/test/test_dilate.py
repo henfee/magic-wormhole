@@ -148,7 +148,7 @@ class SubChannelAPI(unittest.TestCase):
     def test_remote_close(self):
         sc, m, scid, hostaddr, peeraddr, p = make_sc()
         sc.remote_close()
-        self.assertEqual(m.mock_calls, [mock.call.subchannel_closed(scid, sc)])
+        self.assertEqual(m.mock_calls, [mock.call.subchannel_closed(sc)])
         self.assert_connectionDone(p.mock_calls)
 
     def test_data(self):
@@ -1059,6 +1059,7 @@ class InboundTest(unittest.TestCase):
 
 Pauser = namedtuple("Pauser", ["seqnum"])
 NonPauser = namedtuple("NonPauser", ["seqnum"])
+Stopper = namedtuple("Stopper", ["sc"])
 
 def make_outbound():
     m = mock.Mock()
@@ -1074,6 +1075,8 @@ def make_outbound():
     def maybe_pause(r):
         if isinstance(r, Pauser):
             o.pauseProducing()
+        elif isinstance(r, Stopper):
+            o.subchannel_unregisterProducer(r.sc)
     c.send_record = mock.Mock(side_effect=maybe_pause)
     o._test_eq = eq
     o._test_term = term
@@ -1117,15 +1120,17 @@ class OutboundTest(unittest.TestCase):
         o.handle_ack(r1.seqnum) # ignored
         self.assertEqual(list(o._outbound_queue), [])
 
-    def test_connection(self):
+    def test_duplicate_registerProducer(self):
         o, m, c = make_outbound()
-        o.use_connection(c)
-        self.assertEqual(c.mock_calls, [mock.call.registerProducer(o, True)])
-        clear_mock_calls(c)
-
-        o.stop_using_connection()
-        self.assertEqual(c.mock_calls, [mock.call.unregisterProducer()])
-        clear_mock_calls(c)
+        sc1 = object()
+        p1 = mock.Mock()
+        o.subchannel_registerProducer(sc1, p1, True)
+        with self.assertRaises(ValueError) as ar:
+            o.subchannel_registerProducer(sc1, p1, True)
+        s = str(ar.exception)
+        self.assertIn("registering producer", s)
+        self.assertIn("before previous one", s)
+        self.assertIn("was unregistered", s)
 
     def test_connection_send_queued_unpaused(self):
         o, m, c = make_outbound()
@@ -1341,6 +1346,53 @@ class OutboundTest(unittest.TestCase):
         self.assertEqual(list(o._all_producers), [p1, p2, p3])
         self.assertFalse(o._paused)
 
+        # now a producer disconnects itself (spontaneously, not from inside a
+        # resumeProducing)
+        o.subchannel_unregisterProducer(sc1)
+        self.assertEqual(list(o._all_producers), [p2, p3])
+        self.assertEqual(p1.mock_calls, [])
+        self.assertFalse(o._paused)
+
+        # and another disconnects itself when called
+        p2.resumeProducing.side_effect = lambda: None
+        p3.resumeProducing.side_effect = lambda: o.subchannel_unregisterProducer(sc3)
+        o.pauseProducing()
+        o.resumeProducing()
+        self.assertEqual(p2.mock_calls, [mock.call.pauseProducing(),
+                                         mock.call.resumeProducing()])
+        self.assertEqual(p3.mock_calls, [mock.call.pauseProducing(),
+                                         mock.call.resumeProducing()])
+        clear_mock_calls(p2, p3)
+        self.assertEqual(list(o._all_producers), [p2])
+        self.assertFalse(o._paused)
+
+    def test_subchannel_closed(self):
+        o, m, c = make_outbound()
+
+        sc1 = mock.Mock()
+        p1 = mock.Mock(name="p1")
+        o.subchannel_registerProducer(sc1, p1, True)
+        self.assertEqual(p1.mock_calls, [mock.call.pauseProducing()])
+        clear_mock_calls(p1)
+
+        o.subchannel_closed(sc1)
+        self.assertEqual(p1.mock_calls, [])
+        self.assertEqual(list(o._all_producers), [])
+
+        sc2 = mock.Mock()
+        o.subchannel_closed(sc2)
+
+    def test_disconnect(self):
+        o, m, c = make_outbound()
+        o.use_connection(c)
+
+        sc1 = mock.Mock()
+        p1 = mock.Mock(name="p1")
+        o.subchannel_registerProducer(sc1, p1, True)
+        self.assertEqual(p1.mock_calls, [])
+        o.stop_using_connection()
+        self.assertEqual(p1.mock_calls, [mock.call.pauseProducing()])
+
     def OFF_test_push_pull(self):
         # use one IPushProducer and one IPullProducer. They should take turns
         o, m, c = make_outbound()
@@ -1406,8 +1458,6 @@ class OutboundTest(unittest.TestCase):
         # until the Connection is paused, or 10ms have passed, whichever comes
         # first, and if it's stopped by the timer, then the next EventualQueue
         # turn will start it off again)
-        records = [NonPauser(seqnum=1)] * 10
-        records.append(Pauser(seqnum=2))
 
         o, m, c = make_outbound()
         eq = o._test_eq
@@ -1418,6 +1468,10 @@ class OutboundTest(unittest.TestCase):
         sc1 = mock.Mock()
         p1 = mock.Mock(name="p1")
         alsoProvides(p1, IPullProducer)
+
+        records = [NonPauser(seqnum=1)] * 10
+        records.append(Pauser(seqnum=2))
+        records.append(Stopper(sc1))
         it = iter(records)
         p1.resumeProducing.side_effect = lambda: c.send_record(next(it))
         o.subchannel_registerProducer(sc1, p1, False)
@@ -1425,9 +1479,18 @@ class OutboundTest(unittest.TestCase):
 
         self.assertTrue(o._paused)
         self.assertEqual(c.mock_calls,
-                         [mock.call.send_record(r) for r in records])
+                         [mock.call.send_record(r) for r in records[:-1]])
         self.assertEqual(p1.mock_calls,
-                         [mock.call.resumeProducing()]*len(records))
+                         [mock.call.resumeProducing()]*(len(records)-1))
+        clear_mock_calls(c, p1)
+
+        # next resumeProducing should cause it to disconnect
+        o.resumeProducing()
+        eq.flush_sync()
+        self.assertEqual(c.mock_calls, [mock.call.send_record(records[-1])])
+        self.assertEqual(p1.mock_calls, [mock.call.resumeProducing()])
+        self.assertEqual(len(o._all_producers), 0)
+        self.assertFalse(o._paused)
 
     def test_two_pull_producers(self):
         # we should alternate between them until paused
@@ -1487,6 +1550,38 @@ class OutboundTest(unittest.TestCase):
         self.assertEqual(p1.mock_calls, 4*sends)
         self.assertEqual(p2.mock_calls, 5*sends)
         clear_mock_calls(c, p1, p2)
+
+    def test_send_if_connected(self):
+        o, m, c = make_outbound()
+        o.send_if_connected(Ack(1)) # not connected yet
+
+        o.use_connection(c)
+        o.send_if_connected(KCM())
+        self.assertEqual(c.mock_calls, [mock.call.registerProducer(o, True),
+                                        mock.call.send_record(KCM())])
+
+    def test_tolerate_duplicate_pause_resume(self):
+        o, m, c = make_outbound()
+        self.assertTrue(o._paused) # no connection
+        o.use_connection(c)
+        self.assertFalse(o._paused)
+        o.pauseProducing()
+        self.assertTrue(o._paused)
+        o.pauseProducing()
+        self.assertTrue(o._paused)
+        o.resumeProducing()
+        self.assertFalse(o._paused)
+        o.resumeProducing()
+        self.assertFalse(o._paused)
+
+    def test_stopProducing(self):
+        o, m, c = make_outbound()
+        o.use_connection(c)
+        self.assertFalse(o._paused)
+        o.stopProducing() # connection does this before loss
+        self.assertTrue(o._paused)
+        o.stop_using_connection()
+        self.assertTrue(o._paused)
 
 def make_pushpull(pauses):
     p = mock.Mock()

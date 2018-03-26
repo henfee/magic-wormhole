@@ -214,11 +214,10 @@ class Outbound(object):
         # streaming==True: IPushProducer (pause/resume)
         # streaming==False: IPullProducer (just resume)
         if sc in self._subchannel_producers:
-            if self.producer:
-                raise ValueError(
-                    "registering producer %s before previous one (%s) was "
-                    "unregistered" % (producer,
-                                      self._subchannel_producers[sc]))
+            raise ValueError(
+                "registering producer %s before previous one (%s) was "
+                "unregistered" % (producer,
+                                  self._subchannel_producers[sc]))
         # our underlying Connection uses streaming==True, so to make things
         # easier, use an adapter when the Subchannel asks for streaming=False
         if not streaming:
@@ -255,7 +254,7 @@ class Outbound(object):
         self._unpaused_push_producers.discard(p)
         self._check_invariants()
 
-    def subchannel_closed(self, scid, sc):
+    def subchannel_closed(self, sc):
         self._check_invariants()
         if sc in self._subchannel_producers:
             self.subchannel_unregisterProducer(sc)
