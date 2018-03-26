@@ -224,11 +224,11 @@ class Boss(object):
         # this is only called for side != ours
         assert isinstance(phase, type("")), type(phase)
         assert isinstance(plaintext, type(b"")), type(plaintext)
-        d_mo = re.search(r'^dilate-\d+$', phase)
+        d_mo = re.search(r'^dilate-(\d+)$', phase)
         if phase == "version":
             self._got_version(side, plaintext)
         elif d_mo:
-            self._got_dilate(int(d_mo.groups(1)), plaintext)
+            self._got_dilate(int(d_mo.group(1)), plaintext)
         elif re.search(r'^\d+$', phase):
             self._got_phase(int(phase), plaintext)
         else:
@@ -298,6 +298,9 @@ class Boss(object):
     def W_got_key(self, key):
         self._W.got_key(key)
     @m.output()
+    def D_got_key(self, key):
+        self._D.got_key(key)
+    @m.output()
     def W_got_verifier(self, verifier):
         self._W.got_verifier(verifier)
     @m.output()
@@ -313,7 +316,7 @@ class Boss(object):
     def D_received_dilate(self, seqnum, plaintext):
         assert isinstance(seqnum, six.integer_types), type(seqnum)
         # strict phase order, no gaps
-        self._rx_dilate_seqnum[seqnum] = plaintext
+        self._rx_dilate_seqnums[seqnum] = plaintext
         while self._next_rx_dilate_seqnum in self._rx_dilate_seqnums:
             m = self._rx_dilate_seqnums.pop(self._next_rx_dilate_seqnum)
             self._D.received_dilate(m)
@@ -341,7 +344,7 @@ class Boss(object):
     S1_lonely.upon(scared, enter=S3_closing, outputs=[close_scared])
     S1_lonely.upon(close, enter=S3_closing, outputs=[close_lonely])
     S1_lonely.upon(send, enter=S1_lonely, outputs=[S_send])
-    S1_lonely.upon(got_key, enter=S1_lonely, outputs=[W_got_key])
+    S1_lonely.upon(got_key, enter=S1_lonely, outputs=[W_got_key, D_got_key])
     S1_lonely.upon(rx_error, enter=S3_closing, outputs=[close_error])
     S1_lonely.upon(error, enter=S4_closed, outputs=[W_close_with_error])
 

@@ -152,7 +152,7 @@ NOISEPROTO = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s"
 @implementer(IDilationConnector)
 class Connector(object):
     _dilation_key = attrib(validator=instance_of(type(b"")))
-    _relay_url = attrib(validator=optional(instance_of(str)))
+    _transit_relay_location = attrib(validator=optional(instance_of(str)))
     _manager = attrib(validator=provides(IDilationManager))
     _reactor = attrib()
     _eventual_queue = attrib()
@@ -161,7 +161,6 @@ class Connector(object):
     _timing = attrib()
     _side = attrib(validator=instance_of(str))
     # was self._side = bytes_to_hexstr(os.urandom(8)) # unicode
-    _eventual_queue = attrib()
     _role = attrib()
 
     m = MethodicalMachine()
@@ -170,16 +169,16 @@ class Connector(object):
     RELAY_DELAY = 2.0
 
     def __attrs_post_init__(self):
-        if self._relay_url:
+        if self._transit_relay_location:
             # TODO: allow multiple hints for a single relay
-            relay_hint = parse_hint_argv(self._relay_url)
+            relay_hint = parse_hint_argv(self._transit_relay_location)
             relay = RelayV1Hint(hints=(relay_hint,))
             self._transit_relays = [relay]
         else:
             self._transit_relays = []
         self._listeners = set() # IListeningPorts that can be stopped
         self._pending_connectors = set() # Deferreds that can be cancelled
-        self._pending_connections = EmptyableSet() # Protocols to be stopped
+        self._pending_connections = EmptyableSet(_eventual_queue=self._eventual_queue) # Protocols to be stopped
         self._contenders = set() # viable connections
         self._winning_connection = None
         self._timing = self._timing or DebugTiming()
@@ -340,7 +339,7 @@ class Connector(object):
         # to make firewall configs easier
         # TODO: retain listening port between connection generations?
         ep = serverFromString(self._reactor, "tcp:0")
-        f = InboundConnectionFactory(self, self._dilation_key)
+        f = InboundConnectionFactory(self)
         d = ep.listen(f)
         def _listening(lp):
             # lp is an IListeningPort
@@ -420,7 +419,7 @@ class Connector(object):
         if is_relay:
             relay_handshake = build_sided_relay_handshake(self._dilation_key,
                                                           self._side)
-        f = OutboundConnectionFactory(self, relay_handshake, self._dilation_key)
+        f = OutboundConnectionFactory(self, relay_handshake)
         d = ep.connect(f)
         # fires with protocol, or ConnectError
         def _connected(p):

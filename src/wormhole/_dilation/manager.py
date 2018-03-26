@@ -1,5 +1,7 @@
 from __future__ import print_function, unicode_literals
+from collections import deque
 from attr import attrs, attrib
+from attr.validators import provides, instance_of, optional
 from automat import MethodicalMachine
 from zope.interface import implementer
 from twisted.internet.defer import Deferred, inlineCallbacks, returnValue
@@ -7,6 +9,7 @@ from twisted.python import log
 from .._interfaces import IDilator, IDilationManager, ISend
 from ..util import dict_to_bytes, bytes_to_dict
 from ..observer import OneShotObserver
+from .._key import derive_key
 from .encode import to_be4
 from .subchannel import (SubChannel, _SubchannelAddress, _WormholeAddress,
                          ControlEndpoint, SubchannelConnectorEndpoint,
@@ -23,20 +26,26 @@ class OldPeerCannotDilateError(Exception):
 @attrs
 @implementer(IDilationManager)
 class _ManagerBase(object):
+    _S = attrib(validator=provides(ISend))
+    _side = attrib()
+    _transit_key = attrib(validator=instance_of(bytes))
+    _transit_relay_location = attrib(validator=optional(instance_of(str)))
     _reactor = attrib()
     _eventual_queue = attrib()
     _cooperator = attrib()
+    _no_listen = False # TODO
+    _tor = None # TODO
+    _timing = None # TODO
 
     def __attrs_post_init__(self):
         self._got_versions_d = Deferred()
-
-        self._started = False
-        self._endpoints = OneShotObserver(self._eventual_queue)
 
         self._connection = None
         self._made_first_connection = False
         self._first_connected = OneShotObserver(self._eventual_queue)
         self._host_addr = _WormholeAddress()
+
+        self._next_dilation_phase = 0
 
         self._next_subchannel_id = 0 # increments by 2
 
@@ -62,7 +71,7 @@ class _ManagerBase(object):
         self._S.send("dilate-%d" % dilation_phase, dict_to_bytes(fields))
 
     def send_hints(self, hints): # from Connector
-        self.send_dilation_phase(type="hints", hints=hints)
+        self.send_dilation_phase(type="connection-hints", hints=hints)
 
 
     # forward inbound-ish things to _Inbound
@@ -103,11 +112,12 @@ class _ManagerBase(object):
 
 
     def _start_connecting(self, role):
-        self._connector = Connector(self._transit_key, self._relay_url, self,
+        self._connector = Connector(self._transit_key,
+                                    self._transit_relay_location,
+                                    self,
                                     self._reactor, self._eventual_queue,
                                     self._no_listen, self._tor,
                                     self._timing, self._side,
-                                    self._eventual_queue,
                                     role)
         self._connector.start()
 
@@ -250,6 +260,7 @@ class ManagerLeader(_ManagerBase):
     def use_hints(self, hint_message):
         hint_objs = filter(lambda h: h, # ignore None, unrecognizable
                            [parse_hint(hs) for hs in hint_message["hints"]])
+        hint_objs = list(hint_objs)
         self._connector.got_hints(hint_objs)
     @m.output()
     def stop_connecting(self):
@@ -431,16 +442,21 @@ class Dilator(object):
 
     def __attrs_post_init__(self):
         self._got_versions_d = Deferred()
+        self._started = False
+        self._endpoints = OneShotObserver(self._eventual_queue)
+        self._pending_inbound_dilate_messages = deque()
+        self._manager = None
 
     def wire(self, sender):
         self._S = ISend(sender)
 
     # this is the primary entry point, called when w.dilate() is invoked
-    def dilate(self):
+    def dilate(self, transit_relay_location=None):
+        self._transit_relay_location = transit_relay_location
         if not self._started:
             self._started = True
             self._start().addBoth(self._endpoints.fire)
-        yield self._endpoints.when_fired()
+        return self._endpoints.when_fired()
 
     @inlineCallbacks
     def _start(self):
@@ -448,17 +464,28 @@ class Dilator(object):
         # the PAKE key works, so we can talk securely, 2: their side, so we
         # know who will lead, and 3: that they can do dilation at all
 
-        (role, dilation_version) = yield self._got_versions_d
+        (role, our_side, dilation_version) = yield self._got_versions_d
 
         if not dilation_version: # 1 or None
             raise OldPeerCannotDilateError()
 
         if role is LEADER:
-            self._manager = ManagerLeader(self._reactor, self._eventual_queue,
+            self._manager = ManagerLeader(self._S, our_side,
+                                          self._transit_key,
+                                          self._transit_relay_location,
+                                          self._reactor, self._eventual_queue,
                                           self._cooperator)
         else:
-            self._manager = ManagerFollower(self._reactor, self._eventual_queue,
+            self._manager = ManagerFollower(self._S, our_side,
+                                            self._transit_key,
+                                            self._transit_relay_location,
+                                            self._reactor, self._eventual_queue,
                                             self._cooperator)
+        self._manager.start()
+
+        while self._pending_inbound_dilate_messages:
+            plaintext = self._pending_inbound_dilate_messages.popleft()
+            self.received_dilate(plaintext)
 
         # we could probably return the endpoints earlier
         yield self._manager.when_first_connected()
@@ -479,6 +506,14 @@ class Dilator(object):
         returnValue(endpoints)
 
     # from Boss
+
+    def got_key(self, key):
+        # TODO: verify this happens before got_wormhole_versions, or add a gate
+        # to tolerate either ordering
+        purpose = b"dilation-v1"
+        LENGTH =32 # TODO: whatever Noise wants, I guess
+        self._transit_key = derive_key(key, purpose, LENGTH)
+
     def got_wormhole_versions(self, our_side, their_side,
                               their_wormhole_versions):
         # this always happens before received_dilate
@@ -487,17 +522,24 @@ class Dilator(object):
         their_dilation_versions = their_wormhole_versions.get("can-dilate", [])
         if 1 in their_dilation_versions:
             dilation_version = 1
-        self._got_versions_d.callback( (my_role, dilation_version) )
+        self._got_versions_d.callback( (my_role, our_side, dilation_version) )
 
     def received_dilate(self, plaintext):
         # this receives new in-order DILATE-n payloads, decrypted but not
         # de-JSONed.
+
+        # this can appear before our .dilate() method is called, in which case
+        # we queue them for later
+        if not self._manager:
+            self._pending_inbound_dilate_messages.append(plaintext)
+            return
+
         message = bytes_to_dict(plaintext)
         type = message["type"]
         if type == "please":
-            self._manager.rx_PLEASE(message)
+            self._manager.rx_PLEASE() # message)
         elif type == "dilate":
-            self._manager.rx_DILATE(message)
+            self._manager.rx_DILATE() #message)
         elif type == "connection-hints":
             self._manager.rx_HINTS(message)
         else:

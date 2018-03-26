@@ -1230,7 +1230,7 @@ class Boss(unittest.TestCase):
         b._RC = Dummy("rc", events, IRendezvousConnector, "start")
         b._C = Dummy("c", events, ICode,
                      "allocate_code", "input_code", "set_code")
-        b._D = Dummy("d", events, IDilator, "got_wormhole_versions")
+        b._D = Dummy("d", events, IDilator, "got_wormhole_versions", "got_key")
         return b, events
 
     def test_basic(self):
@@ -1256,6 +1256,7 @@ class Boss(unittest.TestCase):
         b.got_message("side", "version", b"{}")
         b.got_message("side", "0", b"msg1")
         self.assertEqual(events, [("w.got_key", b"key"),
+                                  ("d.got_key", b"key"),
                                   ("w.got_verifier", b"verifier"),
                                   ("d.got_wormhole_versions", "side", "side", {}),
                                   ("w.got_versions", {}),
