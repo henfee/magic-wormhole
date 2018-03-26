@@ -1411,7 +1411,6 @@ class OutboundTest(unittest.TestCase):
 
         o, m, c = make_outbound()
         eq = o._test_eq
-        term = o._test_term
         o.use_connection(c)
         clear_mock_calls(c)
         self.assertFalse(o._paused)
