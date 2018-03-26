@@ -1429,6 +1429,65 @@ class OutboundTest(unittest.TestCase):
         self.assertEqual(p1.mock_calls,
                          [mock.call.resumeProducing()]*len(records))
 
+    def test_two_pull_producers(self):
+        # we should alternate between them until paused
+        p1_records = ([NonPauser(seqnum=i) for i in range(5)] +
+                      [Pauser(seqnum=5)] +
+                      [NonPauser(seqnum=i) for i in range(6, 10)])
+        p2_records = ([NonPauser(seqnum=i) for i in range(10, 19)] +
+                      [Pauser(seqnum=19)])
+        expected1 = [NonPauser(0), NonPauser(10),
+                     NonPauser(1), NonPauser(11),
+                     NonPauser(2), NonPauser(12),
+                     NonPauser(3), NonPauser(13),
+                     NonPauser(4), NonPauser(14),
+                     Pauser(5)]
+        expected2 = [              NonPauser(15),
+                     NonPauser(6), NonPauser(16),
+                     NonPauser(7), NonPauser(17),
+                     NonPauser(8), NonPauser(18),
+                     NonPauser(9), Pauser(19),
+                     ]
+
+        o, m, c = make_outbound()
+        eq = o._test_eq
+        o.use_connection(c)
+        clear_mock_calls(c)
+        self.assertFalse(o._paused)
+
+        sc1 = mock.Mock()
+        p1 = mock.Mock(name="p1")
+        alsoProvides(p1, IPullProducer)
+        it1 = iter(p1_records)
+        p1.resumeProducing.side_effect = lambda: c.send_record(next(it1))
+        o.subchannel_registerProducer(sc1, p1, False)
+
+        sc2 = mock.Mock()
+        p2 = mock.Mock(name="p2")
+        alsoProvides(p2, IPullProducer)
+        it2 = iter(p2_records)
+        p2.resumeProducing.side_effect = lambda: c.send_record(next(it2))
+        o.subchannel_registerProducer(sc2, p2, False)
+
+        eq.flush_sync() # fast forward into the glorious (paused) future
+
+        sends = [mock.call.resumeProducing()]
+        self.assertTrue(o._paused)
+        self.assertEqual(c.mock_calls,
+                         [mock.call.send_record(r) for r in expected1])
+        self.assertEqual(p1.mock_calls, 6*sends)
+        self.assertEqual(p2.mock_calls, 5*sends)
+        clear_mock_calls(c, p1, p2)
+
+        o.resumeProducing()
+        eq.flush_sync()
+        self.assertTrue(o._paused)
+        self.assertEqual(c.mock_calls,
+                         [mock.call.send_record(r) for r in expected2])
+        self.assertEqual(p1.mock_calls, 4*sends)
+        self.assertEqual(p2.mock_calls, 5*sends)
+        clear_mock_calls(c, p1, p2)
+
 def make_pushpull(pauses):
     p = mock.Mock()
     alsoProvides(p, IPullProducer)
