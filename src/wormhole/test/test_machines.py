@@ -1219,10 +1219,11 @@ class Boss(unittest.TestCase):
         versions = {"app": "version1"}
         reactor = None
         eq = None
+        cooperator = None
         journal = ImmediateJournal()
         tor_manager = None
         b = MockBoss(wormhole, "side", "url", "appid", versions,
-                     reactor, eq, journal, tor_manager,
+                     reactor, eq, cooperator, journal, tor_manager,
                      timing.DebugTiming())
         b._T = Dummy("t", events, ITerminator, "close")
         b._S = Dummy("s", events, ISend, "send")
