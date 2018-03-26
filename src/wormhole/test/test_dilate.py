@@ -1332,7 +1332,7 @@ class OutboundTest(unittest.TestCase):
         self.assertEqual(list(o._all_producers), [p1, p2, p3])
         self.assertFalse(o._paused)
 
-    def test_push_pull(self):
+    def OFF_test_push_pull(self):
         # use one IPushProducer and one IPullProducer. They should take turns
         o, m, c = make_outbound()
         o.use_connection(c)
