@@ -3,7 +3,7 @@ from collections import deque
 from attr import attrs, attrib
 from attr.validators import provides
 from zope.interface import implementer
-from twisted.internet.interfaces import IPushProducer, IPullProducer, IConsumer
+from twisted.internet.interfaces import IPushProducer, IPullProducer
 from twisted.python import log
 from twisted.python.reflect import safe_str
 from .._interfaces import IDilationManager, IOutbound
@@ -222,7 +222,9 @@ class Outbound(object):
         # our underlying Connection uses streaming==True, so to make things
         # easier, use an adapter when the Subchannel asks for streaming=False
         if not streaming:
-            producer = _PullToPush(producer, sc, self._cooperator)
+            def unregister():
+                self.subchannel_unregisterProducer(sc)
+            producer = PullToPush(producer, unregister, self._cooperator)
 
         self._subchannel_producers[sc] = producer
         self._all_producers.append(producer)
@@ -237,7 +239,7 @@ class Outbound(object):
                 # speak
                 producer.pauseProducing() # you wake up sleeping
         else:
-            # our _PullToPush adapter must be started, but if we're paused then
+            # our PullToPush adapter must be started, but if we're paused then
             # we tell it to pause before it gets a chance to write anything
             producer.startStreaming(self._paused)
 
@@ -246,7 +248,7 @@ class Outbound(object):
         # producer for them, then the application reacts to connectionLost
         # with a duplicate unregisterProducer?
         p = self._subchannel_producers.pop(sc)
-        if isinstance(p, _PullToPush):
+        if isinstance(p, PullToPush):
             p.stopStreaming()
         self._all_producers.remove(p)
         self._paused_push_producers.discard(p)
@@ -349,10 +351,10 @@ class Outbound(object):
 # modelled after twisted.internet._producer_helper._PullToPush , but with a
 # configurable Cooperator, a pause-immediately argument to startStreaming()
 @implementer(IPushProducer)
-@attrs
-class _PullToPush(object):
+@attrs(cmp=False)
+class PullToPush(object):
     _producer = attrib(validator=provides(IPullProducer))
-    _consumer = attrib(validator=provides(IConsumer))
+    _unregister = attrib(validator=lambda _a,_b,v: callable(v))
     _cooperator = attrib()
     _finished = False
 
@@ -364,18 +366,17 @@ class _PullToPush(object):
                 log.err(None, "%s failed, producing will be stopped:" %
                         (safe_str(self._producer),))
                 try:
-                    self._consumer.unregisterProducer()
+                    self._unregister()
                     # The consumer should now call stopStreaming() on us,
                     # thus stopping the streaming.
                 except:
                     # Since the consumer blew up, we may not have had
                     # stopStreaming() called, so we just stop on our own:
                     log.err(None, "%s failed to unregister producer:" %
-                            (safe_str(self._consumer),))
+                            (safe_str(self._unregister),))
                     self._finished = True
                     return
             yield None
-
 
     def startStreaming(self, paused):
         self._coopTask = self._cooperator.cooperate(self._pull())

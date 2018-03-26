@@ -1,10 +1,11 @@
 from __future__ import print_function, unicode_literals
 from collections import namedtuple
+from itertools import cycle
 import mock
 from zope.interface import alsoProvides
 from twisted.trial import unittest
-from twisted.internet.task import Clock
-from twisted.internet.interfaces import ITransport
+from twisted.internet.task import Clock, Cooperator
+from twisted.internet.interfaces import ITransport, IPullProducer
 from twisted.internet.error import ConnectionDone
 from noise.exceptions import NoiseInvalidMessage
 from ..eventual import EventualQueue
@@ -30,7 +31,7 @@ from .._dilation.connection import (parse_record, encode_record,
 from .._dilation.inbound import (Inbound, DuplicateOpenError,
                                  DataForMissingSubchannelError,
                                  CloseForMissingSubchannelError)
-from .._dilation.outbound import Outbound
+from .._dilation.outbound import Outbound, PullToPush
 
 
 class Encoding(unittest.TestCase):
@@ -1062,13 +1063,20 @@ NonPauser = namedtuple("NonPauser", ["seqnum"])
 def make_outbound():
     m = mock.Mock()
     alsoProvides(m, IDilationManager)
-    coop = mock.Mock()
+    clock = Clock()
+    eq = EventualQueue(clock)
+    term = mock.Mock(side_effect=lambda: True) # one write per Eventual tick
+    term_factory = lambda: term
+    coop = Cooperator(terminationPredicateFactory=term_factory,
+                      scheduler=eq.eventually)
     o = Outbound(m, coop)
     c = mock.Mock() # Connection
     def maybe_pause(r):
         if isinstance(r, Pauser):
             o.pauseProducing()
     c.send_record = mock.Mock(side_effect=maybe_pause)
+    o._test_eq = eq
+    o._test_term = term
     return o, m, c
 
 class OutboundTest(unittest.TestCase):
@@ -1392,27 +1400,124 @@ class OutboundTest(unittest.TestCase):
         self.assertEqual(list(o._all_producers), [p2, p1]) # p2 still at bat
         clear_mock_calls(p1, p2, c)
 
-    def OFF_test_pull_producer(self): # not ready yet
-        # a single pull producer should write until it is paused
+    def test_pull_producer(self):
+        # a single pull producer should write until it is paused, rate-limited
+        # by the cooperator (so we'll see back-to-back resumeProducing calls
+        # until the Connection is paused, or 10ms have passed, whichever comes
+        # first, and if it's stopped by the timer, then the next EventualQueue
+        # turn will start it off again)
         records = [NonPauser(seqnum=1)] * 10
         records.append(Pauser(seqnum=2))
 
         o, m, c = make_outbound()
+        eq = o._test_eq
+        term = o._test_term
         o.use_connection(c)
         clear_mock_calls(c)
         self.assertFalse(o._paused)
 
-        sc1 = object()
+        sc1 = mock.Mock()
         p1 = mock.Mock(name="p1")
+        alsoProvides(p1, IPullProducer)
         it = iter(records)
-        p1.resumeProducing.side_effect = lambda: next(it)
+        p1.resumeProducing.side_effect = lambda: c.send_record(next(it))
         o.subchannel_registerProducer(sc1, p1, False)
-        print( c.mock_calls)
-        print(p1.mock_calls)
-        self.assertTrue(o._paused)
-        self.assertEqual(c.mock_calls, [mock.call.send_record(r)
-                                        for r in records])
-        self.assertEqual(p1.mock_calls, [mock.call.resumeProducing()]*11)
+        eq.flush_sync() # fast forward into the glorious (paused) future
 
+        self.assertTrue(o._paused)
+        self.assertEqual(c.mock_calls,
+                         [mock.call.send_record(r) for r in records])
+        self.assertEqual(p1.mock_calls,
+                         [mock.call.resumeProducing()]*len(records))
+
+def make_pushpull(pauses):
+    p = mock.Mock()
+    alsoProvides(p, IPullProducer)
+    unregister = mock.Mock()
+
+    clock = Clock()
+    eq = EventualQueue(clock)
+    term = mock.Mock(side_effect=lambda: True) # one write per Eventual tick
+    term_factory = lambda: term
+    coop = Cooperator(terminationPredicateFactory=term_factory,
+                      scheduler=eq.eventually)
+    pp = PullToPush(p, unregister, coop)
+
+    it = cycle(pauses)
+    def action(i):
+        if isinstance(i, Exception):
+            raise i
+        elif i:
+            pp.pauseProducing()
+    p.resumeProducing.side_effect = lambda: action(next(it))
+    return p, unregister, pp, eq
+
+class PretendResumptionError(Exception):
+    pass
+class PretendUnregisterError(Exception):
+    pass
+
+class PushPull(unittest.TestCase):
+    # test our wrapper utility, which I copied from
+    # twisted.internet._producer_helpers since it isn't publically exposed
+
+    def test_start_unpaused(self):
+        p, unr, pp, eq = make_pushpull([True]) # pause on each resumeProducing
+        # if it starts unpaused, it gets one write before being halted
+        pp.startStreaming(False)
+        eq.flush_sync()
+        self.assertEqual(p.mock_calls, [mock.call.resumeProducing()]*1)
+        clear_mock_calls(p)
+
+        # now each time we call resumeProducing, we should see one delivered to
+        # the underlying IPullProducer
+        pp.resumeProducing()
+        eq.flush_sync()
+        self.assertEqual(p.mock_calls, [mock.call.resumeProducing()]*1)
+
+        pp.stopStreaming()
+        pp.stopStreaming() # should tolerate this
+
+    def test_start_unpaused_two_writes(self):
+        p, unr, pp, eq = make_pushpull([False, True]) # pause every other time
+        # it should get two writes, since the first didn't pause
+        pp.startStreaming(False)
+        eq.flush_sync()
+        self.assertEqual(p.mock_calls, [mock.call.resumeProducing()]*2)
+
+    def test_start_paused(self):
+        p, unr, pp, eq = make_pushpull([True]) # pause on each resumeProducing
+        pp.startStreaming(True)
+        eq.flush_sync()
+        self.assertEqual(p.mock_calls, [])
+        pp.stopStreaming()
+
+    def test_stop(self):
+        p, unr, pp, eq = make_pushpull([True])
+        pp.startStreaming(True)
+        pp.stopProducing()
+        eq.flush_sync()
+        self.assertEqual(p.mock_calls, [mock.call.stopProducing()])
+
+    def test_error(self):
+        p, unr, pp, eq = make_pushpull([PretendResumptionError()])
+        unr.side_effect = lambda: pp.stopStreaming()
+        pp.startStreaming(False)
+        eq.flush_sync()
+        self.assertEqual(unr.mock_calls, [mock.call()])
+        self.flushLoggedErrors(PretendResumptionError)
+
+    def test_error_during_unregister(self):
+        p, unr, pp, eq = make_pushpull([PretendResumptionError()])
+        unr.side_effect = PretendUnregisterError()
+        pp.startStreaming(False)
+        eq.flush_sync()
+        self.assertEqual(unr.mock_calls, [mock.call()])
+        self.flushLoggedErrors(PretendResumptionError, PretendUnregisterError)
+
+
+
+
+        
         # TODO: consider making p1/p2/p3 all elements of a shared Mock, maybe I
         # could capture the inter-call ordering that way
