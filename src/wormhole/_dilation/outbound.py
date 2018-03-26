@@ -171,16 +171,15 @@ class Outbound(object):
         self._subchannel_producers = {} # Subchannel -> IProducer
         self._paused = True # our Connection called our pauseProducing
         self._all_producers = deque() # rotates, left-is-next
-        self._paused_push_producers = set()
-        self._unpaused_push_producers = set()
+        self._paused_producers = set()
+        self._unpaused_producers = set()
         self._check_invariants()
 
         self._connection = None
 
     def _check_invariants(self):
-        assert self._unpaused_push_producers.isdisjoint(self._paused_push_producers)
-        assert (self._paused_push_producers
-                .union(self._unpaused_push_producers) ==
+        assert self._unpaused_producers.isdisjoint(self._paused_producers)
+        assert (self._paused_producers.union(self._unpaused_producers) ==
                 set(self._all_producers))
 
     def build_record(self, record_type, *args):
@@ -228,9 +227,9 @@ class Outbound(object):
         self._subchannel_producers[sc] = producer
         self._all_producers.append(producer)
         if self._paused:
-            self._paused_push_producers.add(producer)
+            self._paused_producers.add(producer)
         else:
-            self._unpaused_push_producers.add(producer)
+            self._unpaused_producers.add(producer)
         self._check_invariants()
         if streaming:
             if self._paused:
@@ -250,8 +249,8 @@ class Outbound(object):
         if isinstance(p, PullToPush):
             p.stopStreaming()
         self._all_producers.remove(p)
-        self._paused_push_producers.discard(p)
-        self._unpaused_push_producers.discard(p)
+        self._paused_producers.discard(p)
+        self._unpaused_producers.discard(p)
         self._check_invariants()
 
     def subchannel_closed(self, sc):
@@ -299,9 +298,9 @@ class Outbound(object):
             return # someone is confused and called us twice
         self._paused = True
         for p in self._all_producers:
-            if p in self._unpaused_push_producers:
-                self._unpaused_push_producers.remove(p)
-                self._paused_push_producers.add(p)
+            if p in self._unpaused_producers:
+                self._unpaused_producers.remove(p)
+                self._paused_producers.add(p)
                 p.pauseProducing()
 
     def resumeProducing(self):
@@ -317,19 +316,19 @@ class Outbound(object):
             p = self._get_next_unpaused_producer()
             if not p:
                 break
-            self._paused_push_producers.remove(p)
-            self._unpaused_push_producers.add(p)
+            self._paused_producers.remove(p)
+            self._unpaused_producers.add(p)
             p.resumeProducing()
 
     def _get_next_unpaused_producer(self):
         self._check_invariants()
-        if not self._paused_push_producers:
+        if not self._paused_producers:
             return None
         while True:
             p = self._all_producers[0]
             self._all_producers.rotate(-1) # p moves to the end of the line
             # the only unpaused Producers are at the end of the list
-            assert p in self._paused_push_producers
+            assert p in self._paused_producers
             return p
 
     def stopProducing(self):

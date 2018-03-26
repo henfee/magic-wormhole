@@ -1258,7 +1258,7 @@ class OutboundTest(unittest.TestCase):
 
         o.subchannel_registerProducer(sc3, p3, True)
         self.assertEqual(p3.mock_calls, [mock.call.pauseProducing()])
-        self.assertEqual(o._paused_push_producers, set([p1, p2, p3]))
+        self.assertEqual(o._paused_producers, set([p1, p2, p3]))
         self.assertEqual(list(o._all_producers), [p1, p2, p3])
         clear_mock_calls(p3)
 
