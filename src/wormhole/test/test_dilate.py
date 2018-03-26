@@ -1583,6 +1583,20 @@ class OutboundTest(unittest.TestCase):
         o.stop_using_connection()
         self.assertTrue(o._paused)
 
+    def test_resume_error(self):
+        o, m, c = make_outbound()
+        o.use_connection(c)
+        sc1 = mock.Mock()
+        p1 = mock.Mock(name="p1")
+        alsoProvides(p1, IPullProducer)
+        p1.resumeProducing.side_effect = PretendResumptionError
+        o.subchannel_registerProducer(sc1, p1, False)
+        o._test_eq.flush_sync()
+        # the error is supposed to automatically unregister the producer
+        self.assertEqual(list(o._all_producers), [])
+        self.flushLoggedErrors(PretendResumptionError)
+
+
 def make_pushpull(pauses):
     p = mock.Mock()
     alsoProvides(p, IPullProducer)

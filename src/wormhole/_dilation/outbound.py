@@ -295,7 +295,6 @@ class Outbound(object):
     # IProducer: the active connection calls these because we used
     # c.registerProducer to ask for them
     def pauseProducing(self):
-        #print("pauseProducing", self._paused, self._all_producers, self._unpaused_push_producers)
         if self._paused:
             return # someone is confused and called us twice
         self._paused = True
@@ -312,23 +311,15 @@ class Outbound(object):
 
         while not self._paused:
             if self._queued_unsent:
-                #print("send_record from _queued_unsent")
                 r = self._queued_unsent.popleft()
                 self._connection.send_record(r)
-                #print("done send_record from _queued_unsent")
                 continue
             p = self._get_next_unpaused_producer()
             if not p:
                 break
-            if p in self._paused_push_producers:
-                self._paused_push_producers.remove(p)
-                self._unpaused_push_producers.add(p)
-                # if it's in _pull_producers, we leave it there, it's always
-                # paused
-            #print("calling p.resumeProducing", p)
+            self._paused_push_producers.remove(p)
+            self._unpaused_push_producers.add(p)
             p.resumeProducing()
-            #print("did p.resumeProducing", p, self._paused)
-        #print("done resumeProducing")
 
     def _get_next_unpaused_producer(self):
         self._check_invariants()
