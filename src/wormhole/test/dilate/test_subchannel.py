@@ -6,11 +6,11 @@ from twisted.internet.error import ConnectionDone
 from ..._dilation.subchannel import (Once, SubChannel,
                                      _WormholeAddress, _SubchannelAddress,
                                      AlreadyClosedError)
-from .common import mock_manager, mock_wormhole
+from .common import mock_manager
 
 def make_sc(set_protocol=True):
     scid = b"scid"
-    hostaddr = _WormholeAddress(mock_wormhole())
+    hostaddr = _WormholeAddress()
     peeraddr = _SubchannelAddress(scid)
     m = mock_manager()
     sc = SubChannel(scid, m, hostaddr, peeraddr)

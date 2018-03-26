@@ -8,7 +8,7 @@ from twisted.internet.interfaces import (ITransport, IProducer, IConsumer,
                                          IStreamServerEndpoint)
 from twisted.internet.error import ConnectionDone
 from automat import MethodicalMachine
-from .._interfaces import ISubChannel, IDilationManager, IWormhole
+from .._interfaces import ISubChannel, IDilationManager
 
 @attrs
 class Once(object):
@@ -42,9 +42,8 @@ class AlreadyClosedError(Exception):
     pass
 
 @implementer(IAddress)
-@attrs
 class _WormholeAddress(object):
-    _wormhole = attrib(validator=provides(IWormhole))
+    pass
 
 @implementer(IAddress)
 @attrs

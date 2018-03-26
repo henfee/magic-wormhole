@@ -9,7 +9,7 @@ from ..._dilation.subchannel import (ControlEndpoint,
                                      SubchannelListeningPort,
                                      _WormholeAddress, _SubchannelAddress,
                                      SingleUseEndpointError)
-from .common import mock_manager, mock_wormhole
+from .common import mock_manager
 
 class Endpoints(unittest.TestCase):
     def test_control(self):
@@ -43,7 +43,7 @@ class Endpoints(unittest.TestCase):
     def test_connector(self):
         m = mock_manager()
         m.allocate_subchannel_id = mock.Mock(return_value=b"scid")
-        hostaddr = _WormholeAddress(mock_wormhole())
+        hostaddr = _WormholeAddress()
         peeraddr = _SubchannelAddress(b"scid")
         ep = SubchannelConnectorEndpoint(m, hostaddr)
 
@@ -63,7 +63,7 @@ class Endpoints(unittest.TestCase):
     def test_listener(self):
         m = mock_manager()
         m.allocate_subchannel_id = mock.Mock(return_value=b"scid")
-        hostaddr = _WormholeAddress(mock_wormhole())
+        hostaddr = _WormholeAddress()
         ep = SubchannelListenerEndpoint(m, hostaddr)
 
         f = mock.Mock()
