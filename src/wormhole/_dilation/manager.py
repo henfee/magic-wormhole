@@ -25,6 +25,7 @@ class OldPeerCannotDilateError(Exception):
 class _ManagerBase(object):
     _reactor = attrib()
     _eventual_queue = attrib()
+    _cooperator = attrib()
 
     def __attrs_post_init__(self):
         self._got_versions_d = Deferred()
@@ -44,7 +45,7 @@ class _ManagerBase(object):
         # outbound data (with flow-control going "in"), so I split them up
         # into separate pieces.
         self._inbound = Inbound(self, self._host_addr)
-        self._outbound = Outbound(self) # data goes from us to a remote peer
+        self._outbound = Outbound(self, self._cooperator) # from us to peer
 
     def set_listener_endpoint(self, listener_endpoint):
         self._inbound.set_listener_endpoint(listener_endpoint)
@@ -426,6 +427,7 @@ class Dilator(object):
 
     _reactor = attrib()
     _eventual_queue = attrib()
+    _cooperator = attrib()
 
     def __attrs_post_init__(self):
         self._got_versions_d = Deferred()
@@ -452,9 +454,11 @@ class Dilator(object):
             raise OldPeerCannotDilateError()
 
         if role is LEADER:
-            self._manager = ManagerLeader(self._reactor, self._eventual_queue)
+            self._manager = ManagerLeader(self._reactor, self._eventual_queue,
+                                          self._cooperator)
         else:
-            self._manager = ManagerFollower(self._reactor, self._eventual_queue)
+            self._manager = ManagerFollower(self._reactor, self._eventual_queue,
+                                            self._cooperator)
 
         # we could probably return the endpoints earlier
         yield self._manager.when_first_connected()

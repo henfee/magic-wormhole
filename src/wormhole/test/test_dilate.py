@@ -1062,7 +1062,8 @@ NonPauser = namedtuple("NonPauser", ["seqnum"])
 def make_outbound():
     m = mock.Mock()
     alsoProvides(m, IDilationManager)
-    o = Outbound(m)
+    coop = mock.Mock()
+    o = Outbound(m, coop)
     c = mock.Mock() # Connection
     def maybe_pause(r):
         if isinstance(r, Pauser):

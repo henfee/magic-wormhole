@@ -3,6 +3,9 @@ from collections import deque
 from attr import attrs, attrib
 from attr.validators import provides
 from zope.interface import implementer
+from twisted.internet.interfaces import IPushProducer, IPullProducer, IConsumer
+from twisted.python import log
+from twisted.python.reflect import safe_str
 from .._interfaces import IDilationManager, IOutbound
 from .connection import KCM, Ping, Pong, Ack
 
@@ -155,6 +158,7 @@ from .connection import KCM, Ping, Pong, Ack
 class Outbound(object):
     # Manage outbound data: subchannel writes to us, we write to transport
     _manager = attrib(validator=provides(IDilationManager))
+    _cooperator = attrib()
 
     def __attrs_post_init__(self):
         # _outbound_queue holds all messages we've ever sent but not retired
@@ -167,7 +171,6 @@ class Outbound(object):
         self._subchannel_producers = {} # Subchannel -> IProducer
         self._paused = True # our Connection called our pauseProducing
         self._all_producers = deque() # rotates, left-is-next
-        self._pull_producers = set()
         self._paused_push_producers = set()
         self._unpaused_push_producers = set()
         self._check_invariants()
@@ -175,11 +178,8 @@ class Outbound(object):
         self._connection = None
 
     def _check_invariants(self):
-        assert self._pull_producers.isdisjoint(self._unpaused_push_producers)
-        assert self._pull_producers.isdisjoint(self._paused_push_producers)
         assert self._unpaused_push_producers.isdisjoint(self._paused_push_producers)
-        assert (self._pull_producers
-                .union(self._paused_push_producers)
+        assert (self._paused_push_producers
                 .union(self._unpaused_push_producers) ==
                 set(self._all_producers))
 
@@ -219,36 +219,36 @@ class Outbound(object):
                     "registering producer %s before previous one (%s) was "
                     "unregistered" % (producer,
                                       self._subchannel_producers[sc]))
+        # our underlying Connection uses streaming==True, so to make things
+        # easier, use an adapter when the Subchannel asks for streaming=False
+        if not streaming:
+            producer = _PullToPush(producer, sc, self._cooperator)
+
         self._subchannel_producers[sc] = producer
         self._all_producers.append(producer)
+        if self._paused:
+            self._paused_push_producers.add(producer)
+        else:
+            self._unpaused_push_producers.add(producer)
+        self._check_invariants()
         if streaming:
             if self._paused:
-                self._paused_push_producers.add(producer)
-            else:
-                self._unpaused_push_producers.add(producer)
-        else:
-            self._pull_producers.add(producer)
-        self._check_invariants()
-
-        if self._paused:
-            # IPushProducers need to be paused immediately, before they speak
-            if streaming:
+                # IPushProducers need to be paused immediately, before they
+                # speak
                 producer.pauseProducing() # you wake up sleeping
-            # IPullProducers aren't notified until they can write something
         else:
-            # IPushProducers set their own pace if we let them, but
-            # IPullProducers hit the ground running
-            if not streaming:
-                producer.resumeProducing() # you wake up screaming
-                # TODO: only one call? or repeat until we're paused?
+            # our _PullToPush adapter must be started, but if we're paused then
+            # we tell it to pause before it gets a chance to write anything
+            producer.startStreaming(self._paused)
 
     def subchannel_unregisterProducer(self, sc):
         # TODO: what if the subchannel closes, so we unregister their
         # producer for them, then the application reacts to connectionLost
         # with a duplicate unregisterProducer?
         p = self._subchannel_producers.pop(sc)
+        if isinstance(p, _PullToPush):
+            p.stopStreaming()
         self._all_producers.remove(p)
-        self._pull_producers.discard(p)
         self._paused_push_producers.discard(p)
         self._unpaused_push_producers.discard(p)
         self._check_invariants()
@@ -331,13 +331,13 @@ class Outbound(object):
 
     def _get_next_unpaused_producer(self):
         self._check_invariants()
-        if not self._pull_producers and not self._paused_push_producers:
+        if not self._paused_push_producers:
             return None
         while True:
             p = self._all_producers[0]
             self._all_producers.rotate(-1) # p moves to the end of the line
             # the only unpaused Producers are at the end of the list
-            assert p in self._pull_producers or p in self._paused_push_producers
+            assert p in self._paused_push_producers
             return p
 
     def stopProducing(self):
@@ -345,3 +345,58 @@ class Outbound(object):
         # so we don't shut anything down. We do pause everyone, though.
         self.pauseProducing()
 
+
+# modelled after twisted.internet._producer_helper._PullToPush , but with a
+# configurable Cooperator, a pause-immediately argument to startStreaming()
+@implementer(IPushProducer)
+@attrs
+class _PullToPush(object):
+    _producer = attrib(validator=provides(IPullProducer))
+    _consumer = attrib(validator=provides(IConsumer))
+    _cooperator = attrib()
+    _finished = False
+
+    def _pull(self):
+        while True:
+            try:
+                self._producer.resumeProducing()
+            except:
+                log.err(None, "%s failed, producing will be stopped:" %
+                        (safe_str(self._producer),))
+                try:
+                    self._consumer.unregisterProducer()
+                    # The consumer should now call stopStreaming() on us,
+                    # thus stopping the streaming.
+                except:
+                    # Since the consumer blew up, we may not have had
+                    # stopStreaming() called, so we just stop on our own:
+                    log.err(None, "%s failed to unregister producer:" %
+                            (safe_str(self._consumer),))
+                    self._finished = True
+                    return
+            yield None
+
+
+    def startStreaming(self, paused):
+        self._coopTask = self._cooperator.cooperate(self._pull())
+        if paused:
+            self.pauseProducing() # timer is scheduled, but task is removed
+
+    def stopStreaming(self):
+        if self._finished:
+            return
+        self._finished = True
+        self._coopTask.stop()
+
+
+    def pauseProducing(self):
+        self._coopTask.pause()
+
+
+    def resumeProducing(self):
+        self._coopTask.resume()
+
+
+    def stopProducing(self):
+        self.stopStreaming()
+        self._producer.stopProducing()
