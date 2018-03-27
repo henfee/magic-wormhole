@@ -29,7 +29,7 @@ class UnknownDilationMessageType(Exception):
 @implementer(IDilationManager)
 class _ManagerBase(object):
     _S = attrib(validator=provides(ISend))
-    _side = attrib()
+    _side = attrib(validator=instance_of(type(u"")))
     _transit_key = attrib(validator=instance_of(bytes))
     _transit_relay_location = attrib(validator=optional(instance_of(str)))
     _reactor = attrib()
@@ -519,6 +519,8 @@ class Dilator(object):
 
     def got_wormhole_versions(self, our_side, their_side,
                               their_wormhole_versions):
+        assert isinstance(our_side, str), str
+        assert isinstance(their_side, str), str
         # this always happens before received_dilate
         my_role = LEADER if our_side > their_side else FOLLOWER
         dilation_version = None

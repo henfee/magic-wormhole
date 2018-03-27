@@ -159,7 +159,7 @@ class Connector(object):
     _no_listen = attrib(validator=instance_of(bool))
     _tor = attrib()
     _timing = attrib()
-    _side = attrib(validator=instance_of(str))
+    _side = attrib(validator=instance_of(type(u"")))
     # was self._side = bytes_to_hexstr(os.urandom(8)) # unicode
     _role = attrib()
 

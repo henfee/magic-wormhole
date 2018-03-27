@@ -51,10 +51,10 @@ class TestDilator(unittest.TestCase):
         # TODO: test missing can-dilate, and no-overlap
         with mock.patch("wormhole._dilation.manager.ManagerLeader",
                         return_value=m) as ml:
-            dil.got_wormhole_versions(b"us", b"them", {"can-dilate": [1]})
-            # that should create the Manager. Because b"us" > b"them", we're
+            dil.got_wormhole_versions("us", "them", {"can-dilate": [1]})
+            # that should create the Manager. Because "us" > "them", we're
             # the leader
-        self.assertEqual(ml.mock_calls, [mock.call(send, b"us", transit_key,
+        self.assertEqual(ml.mock_calls, [mock.call(send, "us", transit_key,
                                                    None, reactor, eq, coop)])
         self.assertEqual(m.mock_calls, [mock.call.start(),
                                         mock.call.when_first_connected(),
@@ -135,9 +135,9 @@ class TestDilator(unittest.TestCase):
         m.when_first_connected.return_value = Deferred()
         with mock.patch("wormhole._dilation.manager.ManagerFollower",
                         return_value=m) as mf:
-            dil.got_wormhole_versions(b"me", b"you", {"can-dilate": [1]})
-            # b"me" < b"you", so we're the follower
-        self.assertEqual(mf.mock_calls, [mock.call(send, b"me", transit_key,
+            dil.got_wormhole_versions("me", "you", {"can-dilate": [1]})
+            # "me" < "you", so we're the follower
+        self.assertEqual(mf.mock_calls, [mock.call(send, "me", transit_key,
                                                    None, reactor, eq, coop)])
         self.assertEqual(m.mock_calls, [mock.call.start(),
                                         mock.call.when_first_connected(),
@@ -148,7 +148,7 @@ class TestDilator(unittest.TestCase):
         d1 = dil.dilate()
         self.assertNoResult(d1)
 
-        dil.got_wormhole_versions(b"me", b"you", {}) # missing "can-dilate"
+        dil.got_wormhole_versions("me", "you", {}) # missing "can-dilate"
         eq.flush_sync()
         f = self.failureResultOf(d1)
         f.check(OldPeerCannotDilateError)
@@ -159,7 +159,7 @@ class TestDilator(unittest.TestCase):
         d1 = dil.dilate()
         self.assertNoResult(d1)
 
-        dil.got_wormhole_versions(b"me", b"you", {"can-dilate": [-1]})
+        dil.got_wormhole_versions("me", "you", {"can-dilate": [-1]})
         eq.flush_sync()
         f = self.failureResultOf(d1)
         f.check(OldPeerCannotDilateError)
@@ -180,8 +180,8 @@ class TestDilator(unittest.TestCase):
 
         with mock.patch("wormhole._dilation.manager.ManagerLeader",
                         return_value=m) as ml:
-            dil.got_wormhole_versions(b"us", b"them", {"can-dilate": [1]})
-        self.assertEqual(ml.mock_calls, [mock.call(send, b"us", b"key",
+            dil.got_wormhole_versions("us", "them", {"can-dilate": [1]})
+        self.assertEqual(ml.mock_calls, [mock.call(send, "us", b"key",
                                                    None, reactor, eq, coop)])
         self.assertEqual(m.mock_calls, [mock.call.start(),
                                         mock.call.rx_PLEASE(),
@@ -198,8 +198,8 @@ class TestDilator(unittest.TestCase):
         self.assertNoResult(d1)
 
         with mock.patch("wormhole._dilation.manager.ManagerLeader") as ml:
-            dil.got_wormhole_versions(b"us", b"them", {"can-dilate": [1]})
-        self.assertEqual(ml.mock_calls, [mock.call(send, b"us", b"key",
+            dil.got_wormhole_versions("us", "them", {"can-dilate": [1]})
+        self.assertEqual(ml.mock_calls, [mock.call(send, "us", b"key",
                                                    relay, reactor, eq, coop),
                                          mock.call().start(),
                                          mock.call().when_first_connected()])
