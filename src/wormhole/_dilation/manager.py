@@ -22,6 +22,8 @@ from .outbound import Outbound
 
 class OldPeerCannotDilateError(Exception):
     pass
+class UnknownDilationMessageType(Exception):
+    pass
 
 @attrs
 @implementer(IDilationManager)
@@ -490,16 +492,17 @@ class Dilator(object):
         # we could probably return the endpoints earlier
         yield self._manager.when_first_connected()
         # we can open subchannels as soon as we get our first connection
-        peer_addr = _SubchannelAddress()
-        control_ep = ControlEndpoint(peer_addr)
         scid0 = b"\x00\x00\x00\x00"
-        sc0 = SubChannel(scid0, self._manager, self._host_addr, peer_addr)
+        self._host_addr = _WormholeAddress() # TODO: share with Manager
+        peer_addr0 = _SubchannelAddress(scid0)
+        control_ep = ControlEndpoint(peer_addr0)
+        sc0 = SubChannel(scid0, self._manager, self._host_addr, peer_addr0)
         control_ep._subchannel_zero_opened(sc0)
         self._manager.set_subchannel_zero(scid0, sc0)
 
-        connect_ep = SubchannelConnectorEndpoint(self)
+        connect_ep = SubchannelConnectorEndpoint(self._manager, self._host_addr)
 
-        listen_ep = SubchannelListenerEndpoint(self, self._host_addr)
+        listen_ep = SubchannelListenerEndpoint(self._manager, self._host_addr)
         self._manager.set_listener_endpoint(listen_ep)
 
         endpoints = (control_ep, connect_ep, listen_ep)
@@ -543,5 +546,5 @@ class Dilator(object):
         elif type == "connection-hints":
             self._manager.rx_HINTS(message)
         else:
-            log.err("received unknown dilation message type: {}".format(message))
+            log.err(UnknownDilationMessageType(message))
             return
