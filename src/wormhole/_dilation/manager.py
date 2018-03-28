@@ -24,6 +24,8 @@ class OldPeerCannotDilateError(Exception):
     pass
 class UnknownDilationMessageType(Exception):
     pass
+class ReceivedHintsTooEarly(Exception):
+    pass
 
 @attrs
 @implementer(IDilationManager)
@@ -278,7 +280,8 @@ class ManagerLeader(_ManagerBase):
         pass # TODO
     @m.output()
     def signal_error_hints(self, hint_message):
-        pass # TODO
+        log.err(ReceivedHintsTooEarly())
+        raise ReceivedHintsTooEarly() # TODO?
 
     IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error_hints]) # too early
     IDLE.upon(stop, enter=STOPPED, outputs=[])
@@ -287,6 +290,7 @@ class ManagerLeader(_ManagerBase):
     WANTED.upon(start, enter=CONNECTING, outputs=[send_dilate,
                                                   start_connecting])
     WANTED.upon(stop, enter=STOPPED, outputs=[])
+    WANTING.upon(rx_HINTS, enter=WANTING, outputs=[signal_error_hints]) # too early
     WANTING.upon(rx_PLEASE, enter=CONNECTING, outputs=[send_dilate,
                                                        start_connecting])
     WANTING.upon(stop, enter=STOPPED, outputs=[])
