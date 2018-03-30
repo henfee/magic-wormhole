@@ -295,9 +295,11 @@ class ManagerShared(_ManagerBase):
 
     @m.output()
     def use_hints(self, hint_message):
+        print("got hints", hint_message)
         hint_objs = filter(lambda h: h, # ignore None, unrecognizable
                            [parse_hint(hs) for hs in hint_message["hints"]])
         hint_objs = list(hint_objs)
+        print(" of which {} are usable".format(hint_objs))
         self._connector.got_hints(hint_objs)
     @m.output()
     def stop_connecting(self):
@@ -515,24 +517,30 @@ class Dilator(object):
         # the PAKE key works, so we can talk securely, 2: their side, so we
         # know who will lead, and 3: that they can do dilation at all
 
+        print("DM._start")
         (role, our_side, dilation_version) = yield self._got_versions_d
+        print("DM _got_versions_d", role, dilation_version)
 
         if not dilation_version: # 1 or None
+            print("DM OldPeerCannotDilateError")
             raise OldPeerCannotDilateError()
 
         if role is LEADER:
+            print("DM LEADER")
             self._manager = ManagerLeader(self._S, our_side,
                                           self._transit_key,
                                           self._transit_relay_location,
                                           self._reactor, self._eventual_queue,
                                           self._cooperator)
         else:
+            print("DM FOLLOWER")
             self._manager = ManagerFollower(self._S, our_side,
                                             self._transit_key,
                                             self._transit_relay_location,
                                             self._reactor, self._eventual_queue,
                                             self._cooperator)
         self._manager.start()
+        print("DM did manager.start")
 
         while self._pending_inbound_dilate_messages:
             plaintext = self._pending_inbound_dilate_messages.popleft()
@@ -585,6 +593,7 @@ class Dilator(object):
         # this can appear before our .dilate() method is called, in which case
         # we queue them for later
         if not self._manager:
+            print("no manager yet, queueing")
             self._pending_inbound_dilate_messages.append(plaintext)
             return
 

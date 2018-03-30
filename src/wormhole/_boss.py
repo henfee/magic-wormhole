@@ -221,6 +221,7 @@ class Boss(object):
     def scared(self): pass
 
     def got_message(self, side, phase, plaintext):
+        print("B.got_message: {} {}".format(phase, plaintext))
         # this is only called for side != ours
         assert isinstance(phase, type("")), type(phase)
         assert isinstance(plaintext, type(b"")), type(plaintext)
