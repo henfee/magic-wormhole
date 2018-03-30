@@ -7,9 +7,13 @@ import mock
 from ...eventual import EventualQueue
 from ..._interfaces import ISend, IDilationManager
 from ...util import dict_to_bytes
+from ..._dilation.roles import LEADER
 from ..._dilation.manager import (Dilator,
                                   OldPeerCannotDilateError,
-                                  UnknownDilationMessageType)
+                                  UnknownDilationMessageType,
+                                  ReceivedHintsTooEarly,
+                                  ManagerLeader,
+                                  )
 from ..._dilation.subchannel import _WormholeAddress
 from .common import clear_mock_calls
 
@@ -80,6 +84,7 @@ class TestDilator(unittest.TestCase):
         m_sle = mock.patch("wormhole._dilation.manager.SubchannelListenerEndpoint",
                            return_value=lep)
 
+        # TODO: see if mock.patch.multiple() would help here
         with m_wa, m_sca, m_ce as m_ce_m, m_sc as m_sc_m, m_sle as m_sle_m:
             wfc_d.callback(None)
             eq.flush_sync()
@@ -203,3 +208,46 @@ class TestDilator(unittest.TestCase):
                                                    relay, reactor, eq, coop),
                                          mock.call().start(),
                                          mock.call().when_first_connected()])
+
+def make_leader():
+    reactor = object()
+    clock = Clock()
+    eq = EventualQueue(clock)
+    term = mock.Mock(side_effect=lambda: True) # one write per Eventual tick
+    term_factory = lambda: term
+    coop = Cooperator(terminationPredicateFactory=term_factory,
+                      scheduler=eq.eventually)
+    send = mock.Mock()
+    alsoProvides(send, ISend)
+    m = ManagerLeader(send, "side", b"key", "relay", reactor, eq, coop)
+    return m, send, reactor, eq, clock, coop
+
+from unittest import util as pyuuu
+pyuuu._MAX_LENGTH = 4000
+from pprint import pprint
+
+class Leader(unittest.TestCase):
+    maxDiff = None
+    def test_good(self):
+        m, send, reactor, eq, clock, coop = make_leader()
+
+        m.start()
+        # Leader waits for the Follower to say PLEASE
+        self.assertEqual(send.mock_calls, [])
+
+        hints = dict(type="connection-hints", hints=[])
+
+        with self.assertRaises(ReceivedHintsTooEarly):
+            m.rx_HINTS(hints) # too early
+        self.flushLoggedErrors(ReceivedHintsTooEarly)
+
+        with mock.patch("wormhole._dilation.manager.Connector") as c:
+            m.rx_PLEASE()
+        self.assertEqual(send.mock_calls,
+                         [mock.call.send("dilate-0",
+                                        dict_to_bytes({"type": "dilate"}))])
+        self.assertEqual(c.mock_calls,
+                         [mock.call(b"key", "relay", m,
+                                    reactor, eq,
+                                    False, None, None, "side", LEADER),
+                          mock.call().start()])
