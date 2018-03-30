@@ -125,7 +125,16 @@ class _ManagerBase(object):
                                     role)
         self._connector.start()
 
-    # our Connector calls these, through our connecting/connected state machine
+    # our Connector calls these
+
+    def connector_connection_made(self, c):
+        self.connection_made() # state machine update
+        pass
+    def connector_connection_lost(self):
+        self._stop_using_connection()
+        if self.role is LEADER:
+            self.initiate_reconnect() # state machine
+
 
     def _use_connection(self, c):
         self._connection = c
@@ -189,30 +198,41 @@ class _ManagerBase(object):
     def allocate_subchannel_id(self):
         raise NotImplemented # subclass knows if we're leader or follower
 
-# current scheme:
-# * only the leader sends DILATE, only follower sends PLEASE
-# * follower sends PLEASE upon w.dilate
-# * leader doesn't send DILATE until receiving PLEASE and local w.dilate
-# * leader handles either order of (w.dilate, rx_PLEASE)
+# new scheme:
+# * both sides send PLEASE as soon as they have an unverified key and
+#    w.dilate has been called,
+# * PLEASE includes a dilation-specific "side" (independent of the "side"
+#    used by mailbox messages)
+# * higher "side" is Leader, lower is Follower
+# * PLEASE includes can-dilate list of version integers, requires overlap
+#    "1" is current
+# * dilation starts as soon as we've sent PLEASE and received PLEASE
+#   (four-state two-variable IDLE/WANTING/WANTED/STARTED diamond FSM)
+# * HINTS sent after dilation starts
+# * only Leader sends RECONNECT, only Follower sends RECONNECTING. This
+#    is the only difference between the two sides, and is not enforced
+#    by the protocol (i.e. if the Follower sends RECONNECT to the Leader,
+#    the Leader will obey, although TODO how confusing will this get?)
+# * upon receiving RECONNECT: drop Connector, start new Connector, send
+#   RECONNECTING, start sending HINTS
+# * upon sending CONNECT: go into FLUSHING state and ignore all HINTS until
+#   RECONNECTING received. The new Connector can be spun up earlier, and it
+#   can send HINTS, but it must not be given any HINTS that arrive before
+#   RECONNECTING (since they're probably stale)
+
+# * after VERSIONS(KCM) received, we might learn that they other side cannot
+#    dilate. w.dilate errbacks at this point
+
 # * maybe signal warning if we stay in a "want" state for too long
-# * after sending DILATE, leader sends HINTS without waiting for response
 # * nobody sends HINTS until they're ready to receive
-# * nobody sends HINTS unless they've called w.dilate()
+# * nobody sends HINTS unless they've called w.dilate() and received PLEASE
 # * nobody connects to inbound hints unless they've called w.dilate()
 # * if leader calls w.dilate() but not follower, leader waits forever in
 #   "want" (doesn't send anything)
 # * if follower calls w.dilate() but not leader, follower waits forever
 #   in "want", leader waits forever in "wanted"
 
-# We're "idle" until all three of:
-# 1: we receive the initial VERSION message and learn our peer's "side"
-#    value (then we compare sides, and the higher one is "leader", and
-#    the lower one is "follower")
-# 2: the peer is capable of dilation, qv version["can-dilate"] which is
-#    a list of integers, require some overlap, "1" is current
-# 3: the local app calls w.dilate()
-
-class ManagerLeader(_ManagerBase):
+class ManagerShared(_ManagerBase):
     m = MethodicalMachine()
     set_trace = getattr(m, "_setTrace", lambda self, f: None)
 
@@ -227,30 +247,43 @@ class ManagerLeader(_ManagerBase):
     def CONNECTING(self): pass # pragma: no cover
     @m.state()
     def CONNECTED(self): pass # pragma: no cover
+    @m.state()
+    def FLUSHING(self): pass # pragma: no cover
     @m.state(terminal=True)
     def STOPPED(self): pass # pragma: no cover
 
     @m.input()
     def start(self): pass # pragma: no cover
     @m.input()
-    def rx_PLEASE(self): pass # pragma: no cover
+    def rx_PLEASE(self, message): pass # pragma: no cover
     @m.input()
-    def rx_DILATE(self): pass # pragma: no cover
+    def rx_RECONNECT(self): pass # pragma: no cover
+    @m.input()
+    def rx_RECONNECTING(self): pass # pragma: no cover
     @m.input()
     def rx_HINTS(self, hint_message): pass # pragma: no cover
 
     @m.input()
     def connection_made(self, c): pass # pragma: no cover
+    #@m.input()
+    #def connection_lost(self): pass # pragma: no cover
     @m.input()
-    def connection_lost(self): pass # pragma: no cover
+    def initiate_reconnect(self): pass
 
     @m.input()
     def stop(self): pass # pragma: no cover
 
     # these Outputs behave differently for the Leader vs the Follower
     @m.output()
-    def send_dilate(self):
-        self.send_dilation_phase(type="dilate")
+    def send_please(self):
+        self.send_dilation_phase(type="please")
+
+    @m.output()
+    def send_reconnect(self):
+        self.send_dilation_phase(type="reconnect")
+    @m.output()
+    def send_reconnecting(self):
+        self.send_dilation_phase(type="reconnecting")
 
     @m.output()
     def start_connecting(self):
@@ -283,38 +316,50 @@ class ManagerLeader(_ManagerBase):
         log.err(ReceivedHintsTooEarly())
         raise ReceivedHintsTooEarly() # TODO?
 
-    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error_hints]) # too early
-    IDLE.upon(stop, enter=STOPPED, outputs=[])
-    IDLE.upon(rx_PLEASE, enter=WANTED, outputs=[])
-    IDLE.upon(start, enter=WANTING, outputs=[])
-    WANTED.upon(start, enter=CONNECTING, outputs=[send_dilate,
-                                                  start_connecting])
-    WANTED.upon(stop, enter=STOPPED, outputs=[])
-    WANTING.upon(rx_HINTS, enter=WANTING, outputs=[signal_error_hints]) # too early
-    WANTING.upon(rx_PLEASE, enter=CONNECTING, outputs=[send_dilate,
-                                                       start_connecting])
-    WANTING.upon(stop, enter=STOPPED, outputs=[])
+    # we don't start CONNECTING until a local start() plus rx_PLEASE
+    IDLE.upon(rx_PLEASE, enter=WANTED, outputs=[stash_side])
+    IDLE.upon(start, enter=WANTING, outputs=[send_please])
+    WANTED.upon(start, enter=CONNECTING, outputs=[start_connecting])
+    WANTING.upon(rx_PLEASE, enter=CONNECTING, outputs=[stash_side,
+                                                       start_connecting2])
 
-    CONNECTING.upon(rx_HINTS, enter=CONNECTING, outputs=[use_hints])
     CONNECTING.upon(connection_made, enter=CONNECTED, outputs=[use_connection])
-    CONNECTING.upon(stop, enter=STOPPED, outputs=[stop_connecting])
-    # leader shouldn't be getting rx_DILATE, and connection_lost only happens
-    # while connected
 
-    CONNECTED.upon(rx_HINTS, enter=CONNECTED, outputs=[]) # too late, ignore
+    # Follower
+    CONNECTING.upon(rx_RECONNECT, enter=CONNECTING, outputs=[stop_connecting,
+                                                             send_reconnecting,
+                                                             start_connecting])
+    CONNECTED.upon(rx_RECONNECT, enter=CONNECTING, outputs=[stop_using_connection,
+                                                            send_reconnecting,
+                                                            start_connecting])
+    # connection_lost only happens while connected
+
+    # Leader
+    CONNECTED.upon(initiate_reconnect, enter=FLUSHING, outputs=[send_reconnect,
+                                                                start_connecting])
+    FLUSHING.upon(rx_RECONNECTING, enter=CONNECTING, outputs=[])
+    # TODO: not connection_lost, more like "i made an adult decision to stop
+    # using this connection, which I can do because i'm the leader"
+    # XXX
     CONNECTED.upon(connection_lost, enter=CONNECTING,
                    outputs=[stop_using_connection,
                             send_dilate,
                             start_connecting])
-    CONNECTED.upon(stop, enter=STOPPED, outputs=[stop_using_connection])
     # shouldn't happen: rx_DILATE, connection_made
 
-    # we should never receive DILATE, we're the leader
-    IDLE.upon(rx_DILATE, enter=STOPPED, outputs=[signal_error])
-    WANTED.upon(rx_DILATE, enter=STOPPED, outputs=[signal_error])
-    WANTING.upon(rx_DILATE, enter=STOPPED, outputs=[signal_error])
-    CONNECTING.upon(rx_DILATE, enter=STOPPED, outputs=[signal_error])
-    CONNECTED.upon(rx_DILATE, enter=STOPPED, outputs=[signal_error])
+    # rx_HINTS never changes state, they're just accepted or ignored
+    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error_hints]) # too early
+    WANTING.upon(rx_HINTS, enter=WANTING, outputs=[signal_error_hints]) # too early
+    CONNECTING.upon(rx_HINTS, enter=CONNECTING, outputs=[use_hints])
+    CONNECTED.upon(rx_HINTS, enter=CONNECTED, outputs=[]) # too late, ignore
+    FLUSHING.upon(rx_HINTS, enter=FLUSHING, outputs=[]) # stale, ignore
+
+    IDLE.upon(stop, enter=STOPPED, outputs=[])
+    WANTED.upon(stop, enter=STOPPED, outputs=[])
+    WANTING.upon(stop, enter=STOPPED, outputs=[])
+    CONNECTING.upon(stop, enter=STOPPED, outputs=[stop_connecting])
+    CONNECTED.upon(stop, enter=STOPPED, outputs=[stop_using_connection])
+
 
     def allocate_subchannel_id(self):
         # scid 0 is reserved for the control channel. the leader uses odd
