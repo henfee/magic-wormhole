@@ -31,7 +31,7 @@ class ReceivedHintsTooEarly(Exception):
 @implementer(IDilationManager)
 class _ManagerBase(object):
     _S = attrib(validator=provides(ISend))
-    _side = attrib(validator=instance_of(type(u"")))
+    _my_side = attrib(validator=instance_of(type(u"")))
     _transit_key = attrib(validator=instance_of(bytes))
     _transit_relay_location = attrib(validator=optional(instance_of(str)))
     _reactor = attrib()
@@ -43,6 +43,8 @@ class _ManagerBase(object):
 
     def __attrs_post_init__(self):
         self._got_versions_d = Deferred()
+
+        self._my_role = None # determined upon rx_PLEASE
 
         self._connection = None
         self._made_first_connection = False
@@ -116,33 +118,35 @@ class _ManagerBase(object):
 
 
     def _start_connecting(self, role):
+        assert self._my_role is not None
         self._connector = Connector(self._transit_key,
                                     self._transit_relay_location,
                                     self,
                                     self._reactor, self._eventual_queue,
                                     self._no_listen, self._tor,
-                                    self._timing, self._side,
-                                    role)
+                                    self._timing,
+                                    self._side, # needed for relay handshake
+                                    self._my_role)
         self._connector.start()
 
     # our Connector calls these
 
     def connector_connection_made(self, c):
         self.connection_made() # state machine update
-        pass
-    def connector_connection_lost(self):
-        self._stop_using_connection()
-        if self.role is LEADER:
-            self.initiate_reconnect() # state machine
-
-
-    def _use_connection(self, c):
         self._connection = c
         self._inbound.use_connection(c)
         self._outbound.use_connection(c) # does c.registerProducer
         if not self._made_first_connection:
             self._made_first_connection = True
             self._first_connected.fire(None)
+        pass
+    def connector_connection_lost(self):
+        self._stop_using_connection()
+        if self.role is LEADER:
+            self.connection_lost_leader() # state machine
+        else:
+            self.connection_lost_follower()
+
 
     def _stop_using_connection(self):
         # the connection is already lost by this point
@@ -249,6 +253,12 @@ class ManagerShared(_ManagerBase):
     def CONNECTED(self): pass # pragma: no cover
     @m.state()
     def FLUSHING(self): pass # pragma: no cover
+    @m.state()
+    def ABANDONING(self): pass # pragma: no cover
+    @m.state()
+    def LONELY(self): pass # pragme: no cover
+    @m.state()
+    def STOPPING(self): pass # pragma: no cover
     @m.state(terminal=True)
     def STOPPED(self): pass # pragma: no cover
 
@@ -256,42 +266,52 @@ class ManagerShared(_ManagerBase):
     def start(self): pass # pragma: no cover
     @m.input()
     def rx_PLEASE(self, message): pass # pragma: no cover
+    @m.input() # only sent by Follower
+    def rx_HINTS(self, hint_message): pass # pragma: no cover
     @m.input()
     def rx_RECONNECT(self): pass # pragma: no cover
-    @m.input()
+    @m.input() # only sent by Leader
     def rx_RECONNECTING(self): pass # pragma: no cover
-    @m.input()
-    def rx_HINTS(self, hint_message): pass # pragma: no cover
 
+    # Connector gives us connection_made()
     @m.input()
     def connection_made(self, c): pass # pragma: no cover
-    #@m.input()
-    #def connection_lost(self): pass # pragma: no cover
+
+    # our connection_lost() fires connection_lost_leader or
+    # connection_lost_follower depending upon our role. If either side sees a
+    # problem with the connection (timeouts, bad authentication) then they
+    # just drop it and let connection_lost() handle the cleanup.
     @m.input()
-    def initiate_reconnect(self): pass
+    def connection_lost_leader(self): pass # pragma: no cover
+    @m.input()
+    def connection_lost_follower(self): pass
 
     @m.input()
     def stop(self): pass # pragma: no cover
 
+    @m.output()
+    def stash_side(self, message):
+        their_side = message["side"]
+        self.my_role = LEADER if self._my_side > their_side else FOLLOWER
+
     # these Outputs behave differently for the Leader vs the Follower
     @m.output()
     def send_please(self):
-        self.send_dilation_phase(type="please")
-
-    @m.output()
-    def send_reconnect(self):
-        self.send_dilation_phase(type="reconnect")
-    @m.output()
-    def send_reconnecting(self):
-        self.send_dilation_phase(type="reconnecting")
+        self.send_dilation_phase(type="please", side=self._my_side)
 
     @m.output()
     def start_connecting(self):
-        self._start_connecting(LEADER)
+        self._start_connecting() # TODO: merge
+    @m.output()
+    def ignore_message_start_connecting(self, message):
+        self.start_connecting()
 
-    # these Outputs delegate to the same code in both the Leader and the
-    # Follower, but they must be replicated here because the Automat instance
-    # is on the subclass, not the shared superclass
+    @m.output()
+    def send_reconnect(self):
+        self.send_dilation_phase(type="reconnect") # TODO: generation number?
+    @m.output()
+    def send_reconnecting(self):
+        self.send_dilation_phase(type="reconnecting") # TODO: generation?
 
     @m.output()
     def use_hints(self, hint_message):
@@ -303,174 +323,73 @@ class ManagerShared(_ManagerBase):
     def stop_connecting(self):
         self._connector.stop()
     @m.output()
-    def use_connection(self, c):
-        self._use_connection(c)
-    @m.output()
-    def stop_using_connection(self):
-        self._stop_using_connection()
-    @m.output()
-    def signal_error(self):
-        pass # TODO
-    @m.output()
-    def signal_error_hints(self, hint_message):
-        log.err(ReceivedHintsTooEarly())
-        raise ReceivedHintsTooEarly() # TODO?
+    def abandon_connection(self):
+        # we think we're still connected, but the Leader disagrees. Or we've
+        # been told to shut down.
+        self._connection.disconnect() # let connection_lost do cleanup
+
 
     # we don't start CONNECTING until a local start() plus rx_PLEASE
     IDLE.upon(rx_PLEASE, enter=WANTED, outputs=[stash_side])
     IDLE.upon(start, enter=WANTING, outputs=[send_please])
     WANTED.upon(start, enter=CONNECTING, outputs=[start_connecting])
-    WANTING.upon(rx_PLEASE, enter=CONNECTING, outputs=[stash_side,
-                                                       start_connecting2])
+    WANTING.upon(rx_PLEASE, enter=CONNECTING,
+                 outputs=[stash_side,
+                          ignore_message_start_connecting])
 
-    CONNECTING.upon(connection_made, enter=CONNECTED, outputs=[use_connection])
-
-    # Follower
-    CONNECTING.upon(rx_RECONNECT, enter=CONNECTING, outputs=[stop_connecting,
-                                                             send_reconnecting,
-                                                             start_connecting])
-    CONNECTED.upon(rx_RECONNECT, enter=CONNECTING, outputs=[stop_using_connection,
-                                                            send_reconnecting,
-                                                            start_connecting])
-    # connection_lost only happens while connected
+    CONNECTING.upon(connection_made, enter=CONNECTED, outputs=[])
 
     # Leader
-    CONNECTED.upon(initiate_reconnect, enter=FLUSHING, outputs=[send_reconnect,
-                                                                start_connecting])
-    FLUSHING.upon(rx_RECONNECTING, enter=CONNECTING, outputs=[])
-    # TODO: not connection_lost, more like "i made an adult decision to stop
-    # using this connection, which I can do because i'm the leader"
-    # XXX
-    CONNECTED.upon(connection_lost, enter=CONNECTING,
-                   outputs=[stop_using_connection,
-                            send_dilate,
-                            start_connecting])
-    # shouldn't happen: rx_DILATE, connection_made
+    CONNECTED.upon(connection_lost_leader, enter=FLUSHING,
+                   outputs=[send_reconnect])
+    FLUSHING.upon(rx_RECONNECTING, enter=CONNECTING, outputs=[start_connecting])
+
+    # Follower
+    # if we notice a lost connection, just wait for the Leader to notice too
+    CONNECTED.upon(connection_lost_follower, enter=LONELY, outputs=[])
+    LONELY.upon(rx_RECONNECT, enter=CONNECTING, outputs=[start_connecting])
+    # but if they notice it first, abandon our (seemingly functional)
+    # connection, then tell them that we're ready to try again
+    CONNECTED.upon(rx_RECONNECT, enter=ABANDONING, # they noticed loss
+                   outputs=[abandon_connection])
+    ABANDONING.upon(connection_lost_follower, enter=CONNECTING,
+                    outputs=[send_reconnecting, start_connecting])
+    # and if they notice a problem while we're still connecting, abandon our
+    # incomplete attempt and try again. in this case we don't have to wait
+    # for a connection to finish shutdown
+    CONNECTING.upon(rx_RECONNECT, enter=CONNECTING,
+                    outputs=[stop_connecting,
+                             send_reconnecting,
+                             ignore_message_start_connecting])
+
 
     # rx_HINTS never changes state, they're just accepted or ignored
-    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error_hints]) # too early
-    WANTING.upon(rx_HINTS, enter=WANTING, outputs=[signal_error_hints]) # too early
+    IDLE.upon(rx_HINTS, enter=IDLE, outputs=[]) # too early
+    WANTING.upon(rx_HINTS, enter=WANTING, outputs=[]) # too early
     CONNECTING.upon(rx_HINTS, enter=CONNECTING, outputs=[use_hints])
     CONNECTED.upon(rx_HINTS, enter=CONNECTED, outputs=[]) # too late, ignore
     FLUSHING.upon(rx_HINTS, enter=FLUSHING, outputs=[]) # stale, ignore
+    LONELY.upon(rx_HINTS, enter=FLUSHING, outputs=[]) # stale, ignore
+    ABANDONING.upon(rx_HINTS, enter=ABANDONING, outputs=[]) # shouldn't happen
+    STOPPING.upon(rx_HINTS, enter=STOPPING, outputs=[])
 
     IDLE.upon(stop, enter=STOPPED, outputs=[])
     WANTED.upon(stop, enter=STOPPED, outputs=[])
     WANTING.upon(stop, enter=STOPPED, outputs=[])
     CONNECTING.upon(stop, enter=STOPPED, outputs=[stop_connecting])
-    CONNECTED.upon(stop, enter=STOPPED, outputs=[stop_using_connection])
+    CONNECTED.upon(stop, enter=STOPPING, outputs=[abandon_connection])
+    ABANDONING.upon(stop, enter=STOPPING, outputs=[])
+    FLUSHING.upon(stop, enter=STOPPED, outputs=[stop_connecting])
+    LONELY.upon(stop, enter=STOPPED, outputs=[])
+    WANTING.upon(stop, enter=STOPPED, outputs=[])
+    STOPPING.upon(connection_lost_leader, enter=STOPPED, outputs=[])
+    STOPPING.upon(connection_lost_follower, enter=STOPPED, outputs=[])
 
 
     def allocate_subchannel_id(self):
         # scid 0 is reserved for the control channel. the leader uses odd
         # numbers starting with 1
         scid_num = self._next_outbound_seqnum + 1
-        self._next_outbound_seqnum += 2
-        return to_be4(scid_num)
-
-class ManagerFollower(_ManagerBase):
-    m = MethodicalMachine()
-    set_trace = getattr(m, "_setTrace", lambda self, f: None)
-
-    @m.state(initial=True)
-    def IDLE(self): pass # pragma: no cover
-
-    @m.state()
-    def WANTING(self): pass # pragma: no cover
-    @m.state()
-    def CONNECTING(self): pass # pragma: no cover
-    @m.state()
-    def CONNECTED(self): pass # pragma: no cover
-    @m.state(terminal=True)
-    def STOPPED(self): pass # pragma: no cover
-
-    @m.input()
-    def start(self): pass # pragma: no cover
-    @m.input()
-    def rx_PLEASE(self): pass # pragma: no cover
-    @m.input()
-    def rx_DILATE(self): pass # pragma: no cover
-    @m.input()
-    def rx_HINTS(self, hint_message): pass # pragma: no cover
-
-    @m.input()
-    def connection_made(self, c): pass # pragma: no cover
-    @m.input()
-    def connection_lost(self): pass # pragma: no cover
-    # follower doesn't react to connection_lost, but waits for a new LETS_DILATE
-
-    @m.input()
-    def stop(self): pass # pragma: no cover
-
-    # these Outputs behave differently for the Leader vs the Follower
-    @m.output()
-    def send_please(self):
-        self.send_dilation_phase(type="please")
-
-    @m.output()
-    def start_connecting(self):
-        self._start_connecting(FOLLOWER)
-
-    # these Outputs delegate to the same code in both the Leader and the
-    # Follower, but they must be replicated here because the Automat instance
-    # is on the subclass, not the shared superclass
-
-    @m.output()
-    def use_hints(self, hint_message):
-        hint_objs = filter(lambda h: h, # ignore None, unrecognizable
-                           [parse_hint(hs) for hs in hint_message["hints"]])
-        self._connector.got_hints(hint_objs)
-    @m.output()
-    def stop_connecting(self):
-        self._connector.stop()
-    @m.output()
-    def use_connection(self, c):
-        self._use_connection(c)
-    @m.output()
-    def stop_using_connection(self):
-        self._stop_using_connection()
-    @m.output()
-    def signal_error(self):
-        pass # TODO
-    @m.output()
-    def signal_error_hints(self, hint_message):
-        pass # TODO
-
-    IDLE.upon(rx_HINTS, enter=STOPPED, outputs=[signal_error_hints]) # too early
-    IDLE.upon(rx_DILATE, enter=STOPPED, outputs=[signal_error]) # too early
-    # leader shouldn't send us DILATE before receiving our PLEASE
-    IDLE.upon(stop, enter=STOPPED, outputs=[])
-    IDLE.upon(start, enter=WANTING, outputs=[send_please])
-    WANTING.upon(rx_DILATE, enter=CONNECTING, outputs=[start_connecting])
-    WANTING.upon(stop, enter=STOPPED, outputs=[])
-
-    CONNECTING.upon(rx_HINTS, enter=CONNECTING, outputs=[use_hints])
-    CONNECTING.upon(connection_made, enter=CONNECTED, outputs=[use_connection])
-    # shouldn't happen: connection_lost
-    #CONNECTING.upon(connection_lost, enter=CONNECTING, outputs=[?])
-    CONNECTING.upon(rx_DILATE, enter=CONNECTING, outputs=[stop_connecting,
-                                                          start_connecting])
-    # receiving rx_DILATE while we're still working on the last one means the
-    # leader thought we'd connected, then thought we'd been disconnected, all
-    # before we heard about that connection
-    CONNECTING.upon(stop, enter=STOPPED, outputs=[stop_connecting])
-
-    CONNECTED.upon(connection_lost, enter=WANTING, outputs=[stop_using_connection])
-    CONNECTED.upon(rx_DILATE, enter=CONNECTING, outputs=[stop_using_connection,
-                                                         start_connecting])
-    CONNECTED.upon(rx_HINTS, enter=CONNECTED, outputs=[]) # too late, ignore
-    CONNECTED.upon(stop, enter=STOPPED, outputs=[stop_using_connection])
-    # shouldn't happen: connection_made
-
-    # we should never receive PLEASE, we're the follower
-    IDLE.upon(rx_PLEASE, enter=STOPPED, outputs=[signal_error])
-    WANTING.upon(rx_PLEASE, enter=STOPPED, outputs=[signal_error])
-    CONNECTING.upon(rx_PLEASE, enter=STOPPED, outputs=[signal_error])
-    CONNECTED.upon(rx_PLEASE, enter=STOPPED, outputs=[signal_error])
-
-    def allocate_subchannel_id(self):
-        # the follower uses even numbers starting with 2
-        scid_num = self._next_outbound_seqnum + 2
         self._next_outbound_seqnum += 2
         return to_be4(scid_num)
 
@@ -515,23 +434,17 @@ class Dilator(object):
         # the PAKE key works, so we can talk securely, 2: their side, so we
         # know who will lead, and 3: that they can do dilation at all
 
-        (role, our_side, dilation_version) = yield self._got_versions_d
+        dilation_version = yield self._got_versions_d
 
         if not dilation_version: # 1 or None
             raise OldPeerCannotDilateError()
 
-        if role is LEADER:
-            self._manager = ManagerLeader(self._S, our_side,
-                                          self._transit_key,
-                                          self._transit_relay_location,
-                                          self._reactor, self._eventual_queue,
-                                          self._cooperator)
-        else:
-            self._manager = ManagerFollower(self._S, our_side,
-                                            self._transit_key,
-                                            self._transit_relay_location,
-                                            self._reactor, self._eventual_queue,
-                                            self._cooperator)
+        my_dilation_side = TODO # random
+        self._manager = Manager(self._S, my_dilation_side,
+                                self._transit_key,
+                                self._transit_relay_location,
+                                self._reactor, self._eventual_queue,
+                                self._cooperator)
         self._manager.start()
 
         while self._pending_inbound_dilate_messages:
@@ -568,15 +481,15 @@ class Dilator(object):
 
     def got_wormhole_versions(self, our_side, their_side,
                               their_wormhole_versions):
+        # TODO: remove our_side, their_side
         assert isinstance(our_side, str), str
         assert isinstance(their_side, str), str
         # this always happens before received_dilate
-        my_role = LEADER if our_side > their_side else FOLLOWER
         dilation_version = None
         their_dilation_versions = their_wormhole_versions.get("can-dilate", [])
         if 1 in their_dilation_versions:
             dilation_version = 1
-        self._got_versions_d.callback( (my_role, our_side, dilation_version) )
+        self._got_versions_d.callback(dilation_version)
 
     def received_dilate(self, plaintext):
         # this receives new in-order DILATE-n payloads, decrypted but not
