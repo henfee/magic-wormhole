@@ -268,9 +268,9 @@ class ManagerShared(_ManagerBase):
     def rx_PLEASE(self, message): pass # pragma: no cover
     @m.input() # only sent by Follower
     def rx_HINTS(self, hint_message): pass # pragma: no cover
-    @m.input()
+    @m.input() # only Leader sends RECONNECT, so only Follower receives it
     def rx_RECONNECT(self): pass # pragma: no cover
-    @m.input() # only sent by Leader
+    @m.input() # only Follower sends RECONNECTING, so only Leader receives it
     def rx_RECONNECTING(self): pass # pragma: no cover
 
     # Connector gives us connection_made()
@@ -360,7 +360,7 @@ class ManagerShared(_ManagerBase):
     CONNECTING.upon(rx_RECONNECT, enter=CONNECTING,
                     outputs=[stop_connecting,
                              send_reconnecting,
-                             ignore_message_start_connecting])
+                             start_connecting])
 
 
     # rx_HINTS never changes state, they're just accepted or ignored
@@ -381,7 +381,6 @@ class ManagerShared(_ManagerBase):
     ABANDONING.upon(stop, enter=STOPPING, outputs=[])
     FLUSHING.upon(stop, enter=STOPPED, outputs=[stop_connecting])
     LONELY.upon(stop, enter=STOPPED, outputs=[])
-    WANTING.upon(stop, enter=STOPPED, outputs=[])
     STOPPING.upon(connection_lost_leader, enter=STOPPED, outputs=[])
     STOPPING.upon(connection_lost_follower, enter=STOPPED, outputs=[])
 
