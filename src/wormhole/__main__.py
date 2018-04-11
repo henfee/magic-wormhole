@@ -1,8 +1,7 @@
-if __name__ != "__main__":
-    raise ImportError('this module should not be imported')
+if __name__ == "__main__":
+    from .cli import cli
+    cli.wormhole()
+else:
+    #raise ImportError('this module should not be imported')
+    pass
 
-
-from .cli import cli
-
-
-cli.wormhole()
