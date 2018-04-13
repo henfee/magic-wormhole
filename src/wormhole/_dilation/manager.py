@@ -332,7 +332,7 @@ class ManagerShared(_ManagerBase):
     # we don't start CONNECTING until a local start() plus rx_PLEASE
     IDLE.upon(rx_PLEASE, enter=WANTED, outputs=[stash_side])
     IDLE.upon(start, enter=WANTING, outputs=[send_please])
-    WANTED.upon(start, enter=CONNECTING, outputs=[start_connecting])
+    WANTED.upon(start, enter=CONNECTING, outputs=[send_please, start_connecting])
     WANTING.upon(rx_PLEASE, enter=CONNECTING,
                  outputs=[stash_side,
                           ignore_message_start_connecting])
@@ -365,11 +365,12 @@ class ManagerShared(_ManagerBase):
 
     # rx_HINTS never changes state, they're just accepted or ignored
     IDLE.upon(rx_HINTS, enter=IDLE, outputs=[]) # too early
+    WANTED.upon(rx_HINTS, enter=WANTED, outputs=[]) # too early
     WANTING.upon(rx_HINTS, enter=WANTING, outputs=[]) # too early
     CONNECTING.upon(rx_HINTS, enter=CONNECTING, outputs=[use_hints])
     CONNECTED.upon(rx_HINTS, enter=CONNECTED, outputs=[]) # too late, ignore
     FLUSHING.upon(rx_HINTS, enter=FLUSHING, outputs=[]) # stale, ignore
-    LONELY.upon(rx_HINTS, enter=FLUSHING, outputs=[]) # stale, ignore
+    LONELY.upon(rx_HINTS, enter=LONELY, outputs=[]) # stale, ignore
     ABANDONING.upon(rx_HINTS, enter=ABANDONING, outputs=[]) # shouldn't happen
     STOPPING.upon(rx_HINTS, enter=STOPPING, outputs=[])
 
